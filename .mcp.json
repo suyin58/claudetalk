@@ -1,7 +1,12 @@
 {
   "mcpServers": {
     "dingtalk": {
-      "command": "bun run src/index.ts`
+      "command": "bun",
+      "args": ["run", "/Users/suyin/Documents/WorkSpace/skills/claude-code-dingtalk-channel/src/index.ts"],
+      "env": {
+        "DINGTALK_CLIENT_ID": "dingotqvc15jgddgznu0",
+        "DINGTALK_CLIENT_SECRET": "SceFkz5X5LuZdYA6nmWVQ9eLlnAYTcVdrQgNAcSNNnGIkGlhy03bXIi81ujrJZct"
+      }
     }
   }
 }

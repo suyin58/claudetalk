@@ -1,0 +1,6 @@
+{
+  "enabledMcpjsonServers": [
+    "dingtalk"
+  ],
+  "enableAllProjectMcpServers": true
+}

@@ -80,10 +80,12 @@ export class DingTalkClient {
       }
     );
 
-    const data = (await response.json()) as DingTalkTokenResponse;
+    const data = (await response.json()) as DingTalkTokenResponse & { code?: string; message?: string };
 
-    if (data.errcode !== 0) {
-      throw new Error(`Failed to get access token: ${data.errmsg}`);
+    // 钉钉 v1.0 token 接口失败时返回 { code, message }，成功时返回 { accessToken, expireIn }
+    if (!data.accessToken) {
+      const errorMessage = data.message || data.errmsg || JSON.stringify(data);
+      throw new Error(`Failed to get access token: ${errorMessage}`);
     }
 
     // 缓存 token (提前 60 秒过期)
@@ -140,6 +142,14 @@ export class DingTalkClient {
    * 启动 Stream WebSocket 连接，开始接收钉钉消息
    */
   async start(): Promise<void> {
+    if (!this.config.clientId || !this.config.clientSecret) {
+      throw new Error(
+        'Missing required environment variables.\n' +
+        'Please set:\n' +
+        '  export DINGTALK_CLIENT_ID=your_app_key\n' +
+        '  export DINGTALK_CLIENT_SECRET=your_app_secret'
+      );
+    }
     console.error('Connecting to DingTalk Stream...');
 
     const connectWithRetry = async (retryDelayMs: number = 3000): Promise<void> => {
@@ -202,6 +212,9 @@ export class DingTalkClient {
    */
   private async handleStreamFrame(ws: WebSocket, frame: DingTalkStreamFrame): Promise<void> {
     const { type, headers, data } = frame;
+    // 调试：把所有收到的帧写到日志文件
+    const fs = await import('fs');
+    fs.appendFileSync('/tmp/dingtalk_frames.log', JSON.stringify({ type, topic: headers?.topic, data }) + '\n');
 
     // 回复 ACK
     const ack = {
@@ -274,12 +287,18 @@ export class DingTalkClient {
       }
     }
 
-    // 解析消息内容
+    // 解析消息内容：钉钉文本消息在 text.content 字段里
     let messageText = '';
-    try {
-      const content = JSON.parse(callback.content);
-      messageText = content.content || content.text || JSON.stringify(content);
-    } catch {
+    if (callback.text?.content) {
+      messageText = callback.text.content.trim();
+    } else if (callback.msgtype === 'richText' && callback.content) {
+      try {
+        const parsed = JSON.parse(callback.content);
+        messageText = parsed.content || parsed.text || JSON.stringify(parsed);
+      } catch {
+        messageText = callback.content;
+      }
+    } else if (callback.content) {
       messageText = callback.content;
     }
 
@@ -534,7 +553,7 @@ export class DingTalkClient {
 
     // 1. 上传媒体文件
     const formData = new FormData();
-    formData.append('media', new Blob([mediaBuffer]), fileName);
+    formData.append('media', new Blob([new Uint8Array(mediaBuffer)]), fileName);
     formData.append('type', mediaType);
 
     const uploadResponse = await fetch(

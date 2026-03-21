@@ -43,6 +43,7 @@ export interface DingTalkStreamMessage {
   /** 富文本内容 */
   richText?: string;
   /** 图片内容 */
+  image?: {
     downloadCode: string;
     photoSize?: {
       width: number;
@@ -93,6 +94,10 @@ export interface DingTalkInboundCallback {
   msgId: string;
   /** 会话类型: 1=单聊, 2=群聊 */
   conversationType: '1' | '2';
+  /** 文本消息内容 */
+  text?: {
+    content: string;
+  };
   /** 会话 ID */
   conversationId: string;
   /** 发送者 ID */
