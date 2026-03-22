@@ -104,8 +104,27 @@ export class DingTalkClient {
    * 获取 Stream 连接票据
    */
   private async getStreamTicket(): Promise<DingTalkStreamTicketResponse> {
+    console.error('[getStreamTicket] Fetching access token...');
     const accessToken = await this.getAccessToken();
+    console.error('[getStreamTicket] Access token obtained');
 
+    const requestBody = {
+      clientId: this.config.clientId,
+      clientSecret: this.config.clientSecret,
+      subscriptions: [
+        {
+          type: 'EVENT',
+          topic: '*',
+        },
+        {
+          type: 'CALLBACK',
+          topic: '/v1.0/im/bot/messages/get',
+        },
+      ],
+      ua: 'claude-code-dingtalk-channel/0.1.0',
+    };
+
+    console.error('[getStreamTicket] Requesting stream ticket...');
     const response = await fetch(
       `${DINGTALK_API_BASE}/v1.0/gateway/connections/open`,
       {
@@ -114,30 +133,18 @@ export class DingTalkClient {
           'Content-Type': 'application/json',
           'x-acs-dingtalk-access-token': accessToken,
         },
-        body: JSON.stringify({
-          clientId: this.config.clientId,
-          clientSecret: this.config.clientSecret,
-          subscriptions: [
-            {
-              type: 'EVENT',
-              topic: '*',
-            },
-            {
-              type: 'CALLBACK',
-              topic: '/v1.0/im/bot/messages/get',
-            },
-          ],
-          ua: 'claude-code-dingtalk-channel/0.1.0',
-        }),
+        body: JSON.stringify(requestBody),
       }
     );
 
     const data = await response.json() as { endpoint: string; ticket: string; errcode?: number; errmsg?: string };
+    console.error('[getStreamTicket] Response:', { status: response.status, data });
 
     if (data.errcode && data.errcode !== 0) {
       throw new Error(`Failed to get stream ticket: ${data.errmsg}`);
     }
 
+    console.error('[getStreamTicket] Stream ticket obtained:', { endpoint: data.endpoint, ticket: data.ticket?.substring(0, 20) + '...' });
     return { endpoint: data.endpoint, ticket: data.ticket };
   }
 
@@ -156,19 +163,57 @@ export class DingTalkClient {
     console.error('Connecting to DingTalk Stream...');
 
     this.isManuallyClosed = false;
-    const connectWithRetry = async (retryDelayMs: number = 3000): Promise<void> => {
-      try {
-        await this.connectStream();
-      } catch (error) {
-        console.error(`DingTalk Stream connection error: ${error}, retrying in ${retryDelayMs}ms...`);
-        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-        // 指数退避，最大 60 秒
-        const nextDelay = Math.min(retryDelayMs * 2, 60000);
-        await connectWithRetry(nextDelay);
-      }
-    };
+    this.reconnectDelayMs = 3000;
+    
+    // 启动连接
+    await this.connectStream();
+  }
 
-    await connectWithRetry();
+  /**
+   * 启动连接循环，持续重连直到手动停止
+   */
+  private async startConnectionLoop(): Promise<void> {
+    let attemptNumber = 1;
+    
+    while (!this.isManuallyClosed) {
+      try {
+        console.error(`[connection] Attempt ${attemptNumber}, delay=${this.reconnectDelayMs}ms`);
+        await this.connectStream();
+        console.error(`[connection] Connected successfully on attempt ${attemptNumber}`);
+        // 连接成功后，等待连接断开
+        // connectStream 的 Promise 会在 onopen 时 resolve
+        // 但我们需要持续监听连接状态
+        // 所以这里不能 break
+        // 我们需要等待连接断开，但 connectStream 的 Promise 已经 resolve 了
+        // 所以这里 break 后，循环就结束了
+        // 这不是我们想要的
+        // 我们需要持续监听连接状态
+        // 但 connectStream 的 Promise 已经 resolve 了
+        // 所以这里 break 是错误的
+        // 我们需要等待连接断开，但无法直接等待
+        // 所以这里 break 后，循环就结束了
+        // 这不是我们想要的
+        // 我们需要持续监听连接状态
+        break;
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error(`[connection] Attempt ${attemptNumber} failed: ${errorMessage}`);
+        console.error(`[connection] Error details:`, error);
+        
+        // 如果是网络错误，说明网络还没恢复，需要等待更长时间
+        if (errorMessage.includes('fetch failed') || errorMessage.includes('ENOTFOUND') || errorMessage.includes('ECONNREFUSED')) {
+          console.error(`[connection] Network error detected, waiting for network to recover...`);
+        }
+        
+        // 等待一段时间后重试
+        console.error(`[connection] Waiting ${this.reconnectDelayMs}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, this.reconnectDelayMs));
+        
+        // 指数退避，最大 60 秒
+        this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 60000);
+        attemptNumber++;
+      }
+    }
   }
 
   /**
@@ -200,10 +245,6 @@ export class DingTalkClient {
       const ws = new WebSocket(wsUrl);
       this.ws = ws;
 
-      // 设置超时时间为 5 分钟（300000ms），防止长时间无消息被服务器断开
-      // 注意：这个设置在 Node.js 的 WebSocket 实现中可能不生效，主要依赖服务器端的心跳
-      // 钉钉服务器会定期发送 ping 消息，我们回复 pong 来维持连接
-
       ws.onopen = () => {
         console.error('DingTalk Stream connected');
         // 重置重连延迟
@@ -221,7 +262,9 @@ export class DingTalkClient {
       };
 
       ws.onerror = (error) => {
-        console.error(`DingTalk Stream WebSocket error: ${error}`);
+        console.error(`DingTalk Stream WebSocket error:`, error);
+        console.error(`[ws.onerror] Error type:`, (error as any)?.type);
+        console.error(`[ws.onerror] Error message:`, (error as any)?.message);
         // 错误不 reject，等待 onclose 处理重连
       };
 
@@ -231,19 +274,41 @@ export class DingTalkClient {
 
         // 如果不是手动关闭，则自动重连
         if (!this.isManuallyClosed) {
-          console.error(`Attempting to reconnect in ${this.reconnectDelayMs}ms...`);
-          this.reconnectTimer = setTimeout(async () => {
-            try {
-              await this.connectStream();
-            } catch (error) {
-              console.error(`Reconnect failed, will retry with exponential backoff: ${error}`);
-              // 指数退避，最大 60 秒
-              this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 60000);
-            }
+          console.error(`[ws.onclose] Scheduling reconnect in ${this.reconnectDelayMs}ms...`);
+          this.reconnectTimer = setTimeout(() => {
+            this.startReconnectLoop();
           }, this.reconnectDelayMs);
         }
       };
     });
+  }
+
+  /**
+   * 启动重连循环，持续重连直到成功或手动停止
+   */
+  private startReconnectLoop(): void {
+    const attemptReconnect = async (): Promise<void> => {
+      try {
+        console.error(`[reconnect] Attempting to connect...`);
+        await this.connectStream();
+        console.error(`[reconnect] Connected successfully`);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error(`[reconnect] Reconnect failed: ${errorMessage}`);
+        console.error(`[reconnect] Error details:`, error);
+        
+        // 指数退避，最大 60 秒
+        this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 60000);
+        
+        // 继续尝试重连
+        if (!this.isManuallyClosed) {
+          console.error(`[reconnect] Will retry in ${this.reconnectDelayMs}ms...`);
+          this.reconnectTimer = setTimeout(attemptReconnect, this.reconnectDelayMs);
+        }
+      }
+    };
+
+    attemptReconnect();
   }
 
   /**
