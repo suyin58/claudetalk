@@ -63,9 +63,9 @@ claudetalk
 
 ####  **钉钉机器人应用**：在 [钉钉开放平台](https://open-dev.dingtalk.com) 创建一个企业内部应用，启用机器人能力，获取 AppKey 和 AppSecret
 创建机器人应用
-![创建机器人应用](https://down-cdn.dingtalk.com/ddmedia/iwElAqNwbmcDBgTRDRgF0QXYBrAR0RuG801avgmWW_KAsaIAB9IB61N7CAAJqm9wZW4udG9vbHMKAAvSABO97g.png)
+![创建机器人应用](https://down-cdn.dingtalk.com/ddmedia/iwELAqNwbmcDBgTRDW4F0QWcBrCGJnmU7-17zQmWXqczAm8AB9IB61N7CAAJqm9wZW4udG9vbHMKAAvSABBoig.png)
 开启机器人功能
-![alt text](https://down-cdn.dingtalk.com/ddmedia/iwELAqNwbmcDBgTRC4QF0QZoBrB4hMu8Zv-y7wmWXMLES2oAB9IB61N7CAAJqm9wZW4udG9vbHMKAAvSABb4qA.png)
+![开启机器人功能](https://down-cdn.dingtalk.com/ddmedia/iwELAqNwbmcDBgTRC4QF0QZoBrB4hMu8Zv-y7wmWXMLES2oAB9IB61N7CAAJqm9wZW4udG9vbHMKAAvSABb4qA.png)
 配置完成后会自动启动机器人，在钉钉里给机器人发消息即可开始对话。
 
 ### 日常使用
