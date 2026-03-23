@@ -46,6 +46,11 @@ function loadConfigFromFile(filePath: string, profile?: string): ClaudeTalkConfi
     const content = readFileSync(filePath, 'utf-8')
     const raw = JSON.parse(content) as ClaudeTalkConfig
 
+    // 指定了 profile 但该 profile 不存在时，直接返回 null（不降级到顶层默认配置）
+    if (profile && !raw.profiles?.[profile]) {
+      return null
+    }
+
     // 合并顶层配置和指定 profile 的配置（profile 字段优先）
     const profileOverride = profile ? (raw.profiles?.[profile] ?? {}) : {}
     const merged: ClaudeTalkConfig = {
@@ -226,8 +231,8 @@ async function interactiveSetup(saveToLocal: boolean, workDir: string, profile?:
 
   console.log('')
   console.log('📝 角色描述（可选）')
-  console.log('   设置后，Claude 在每次新建会话时会了解项目背景和职责。')
-  console.log('   示例: "你是一个产品经理，擅长对业务需求进行拆解，形成完整的需求文档"')
+  console.log('   设置后，Claude 在每次新建会话时会了解你的要求。')
+  console.log('   示例: "你在这里面负责什么？有什么特别的要求？"')
   if (existingPrompt) {
     console.log('   直接回车保留原值，输入空格后回车可清除。')
   } else {
@@ -306,12 +311,12 @@ ClaudeTalk - 钉钉机器人接入 Claude Code
       "pm": {
         "DINGTALK_CLIENT_ID": "PM 机器人 AppKey",
         "DINGTALK_CLIENT_SECRET": "PM 机器人 AppSecret",
-        "systemPrompt": "你是一个产品经理，擅长需求拆解..."
+        "systemPrompt": "你在这里面负责产品需求，还负责任务拆解，按照业务要求制定工作计划"
       },
       "dev": {
         "DINGTALK_CLIENT_ID": "Dev 机器人 AppKey",
         "DINGTALK_CLIENT_SECRET": "Dev 机器人 AppSecret",
-        "systemPrompt": "你是一个资深后端工程师..."
+        "systemPrompt": "你在这里面负责服务端架构设计和开发，依据系统间的依赖关系制定开发计划"
       }
     }
   }

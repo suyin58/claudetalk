@@ -296,15 +296,18 @@ export class DingTalkClient {
     }
 
     if (type === 'CALLBACK' && headers.topic === '/v1.0/im/bot/messages/get') {
-      // 机器人收到消息
+      // 先立即回 ACK，避免阻塞 WebSocket 帧循环（Claude 处理消息可能需要数十秒）
       ws.send(JSON.stringify(ack));
 
-      try {
-        const callback = JSON.parse(data) as DingTalkInboundCallback;
-        await this.handleInboundMessage(callback);
-      } catch (error) {
-        console.error(`Failed to parse inbound message: ${error}`);
-      }
+      // 异步处理消息，不阻塞当前帧循环，确保心跳等帧能正常响应
+      Promise.resolve().then(async () => {
+        try {
+          const callback = JSON.parse(data) as DingTalkInboundCallback;
+          await this.handleInboundMessage(callback);
+        } catch (error) {
+          console.error(`Failed to parse inbound message: ${error}`);
+        }
+      });
       return;
     }
 

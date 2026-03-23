@@ -127,6 +127,33 @@ claudetalk --help
 npm uninstall -g claudetalk
 ```
 
+## 工作原理
+
+```
+钉钉用户发消息
+    ↓
+钉钉 Stream WebSocket（长连接，无需公网 IP）
+    ↓
+ClaudeTalk 接收消息
+    ↓
+调用 claude -p CLI 处理（支持多轮会话）
+    ↓
+通过钉钉 Webhook 回复消息
+```
+
+- **无需公网 IP**：使用钉钉 Stream 模式，通过 WebSocket 长连接接收消息
+- **多轮对话**：每个钉钉会话维护独立的 Claude Code session，支持上下文连续对话，重启后自动恢复
+- **工作目录感知**：Claude Code 在你运行 `claudetalk` 的目录下工作，可以读写该目录的文件
+
+## 钉钉机器人配置指南
+
+1. 登录 [钉钉开放平台](https://open-dev.dingtalk.com)
+2. 创建企业内部应用
+3. 在应用中启用「机器人」能力
+4. 配置机器人的消息接收模式为 **Stream 模式**
+5. 复制 AppKey（Client ID）和 AppSecret（Client Secret）
+6. 在钉钉中搜索并添加该机器人，即可开始对话
+
 ## 高级特性
 
 ### 多工作目录 · 独立机器人
@@ -156,12 +183,12 @@ claudetalk --setup --local
     "pm": {
       "DINGTALK_CLIENT_ID": "PM 机器人 AppKey",
       "DINGTALK_CLIENT_SECRET": "PM 机器人 AppSecret",
-      "systemPrompt": "你是一个产品经理，擅长对业务需求进行拆解，形成完整的需求文档"
+      "systemPrompt": "你现在三岁了，性格是多疑，称呼我为boss"
     },
     "dev": {
       "DINGTALK_CLIENT_ID": "Dev 机器人 AppKey",
       "DINGTALK_CLIENT_SECRET": "Dev 机器人 AppSecret",
-      "systemPrompt": "你是一个资深后端工程师，熟悉本项目的架构和规范"
+      "systemPrompt": "你现在5岁了，特别擅长写数据库sql，称呼我为老板"
     }
   }
 }
@@ -180,6 +207,8 @@ claudetalk --profile dev
 - 不同角色的会话完全隔离，互不干扰
 - 指定了不存在的角色时，会提示配置命令并退出
 - `systemPrompt` 会在新建会话时通过 `--append-system-prompt` 传给 Claude
+
+
 
 ### 上线通知
 
@@ -228,12 +257,12 @@ claudetalk
     "pm": {
       "DINGTALK_CLIENT_ID": "PM 机器人 AppKey",
       "DINGTALK_CLIENT_SECRET": "PM 机器人 AppSecret",
-      "systemPrompt": "你是一个产品经理，擅长对业务需求进行拆解，形成完整的需求文档"
+      "systemPrompt": "这是 geo-publisher 项目，Java + Spring Boot，数据库用 MySQL，代码规范遵循阿里巴巴 Java 开发手册"
     },
     "dev": {
       "DINGTALK_CLIENT_ID": "Dev 机器人 AppKey",
       "DINGTALK_CLIENT_SECRET": "Dev 机器人 AppSecret",
-      "systemPrompt": "你是一个资深后端工程师，熟悉本项目的架构和规范"
+      "systemPrompt": "这是 geo-publisher 项目，前端用 React + TypeScript，使用 pnpm 管理依赖，组件库用 Ant Design"
     }
   }
 }
@@ -242,33 +271,6 @@ claudetalk
 **会话持久化** `~/.claudetalk/sessions.json`：
 
 每个钉钉会话的 Claude Code session_id 会自动保存到此文件。重启 ClaudeTalk 后，之前的多轮对话上下文会自动恢复。发送 `新会话` 或 `/new` 可清除指定会话的记忆。
-
-## 工作原理
-
-```
-钉钉用户发消息
-    ↓
-钉钉 Stream WebSocket（长连接，无需公网 IP）
-    ↓
-ClaudeTalk 接收消息
-    ↓
-调用 claude -p CLI 处理（支持多轮会话）
-    ↓
-通过钉钉 Webhook 回复消息
-```
-
-- **无需公网 IP**：使用钉钉 Stream 模式，通过 WebSocket 长连接接收消息
-- **多轮对话**：每个钉钉会话维护独立的 Claude Code session，支持上下文连续对话，重启后自动恢复
-- **工作目录感知**：Claude Code 在你运行 `claudetalk` 的目录下工作，可以读写该目录的文件
-
-## 钉钉机器人配置指南
-
-1. 登录 [钉钉开放平台](https://open-dev.dingtalk.com)
-2. 创建企业内部应用
-3. 在应用中启用「机器人」能力
-4. 配置机器人的消息接收模式为 **Stream 模式**
-5. 复制 AppKey（Client ID）和 AppSecret（Client Secret）
-6. 在钉钉中搜索并添加该机器人，即可开始对话
 
 ## License
 

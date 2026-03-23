@@ -154,7 +154,13 @@ async function callClaude(
     args.push('--resume', existingSessionId)
   }
 
-  log(`[claude] Calling claude CLI with args: ${args.join(' ')}, sessionId=${existingSessionId || 'new'}, cwd=${workDir}`)
+  if (existingSessionId) {
+    log(`[claude] Resuming session: claude ${args.join(' ')}, cwd=${workDir}`)
+  } else {
+    // 新建 session，打印完整命令（含 --append-system-prompt 内容，方便确认角色是否生效）
+    const fullCommand = `claude ${args.join(' ')}`
+    log(`[claude] New session: ${fullCommand}, cwd=${workDir}`)
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn('claude', args, {
@@ -313,7 +319,7 @@ export async function startBot(options: StartBotOptions): Promise<void> {
     // ========== 内置指令处理 ==========
     const command = messageText.toLowerCase()
     if (command === '新会话' || command === '清空记忆' || command === '/new' || command === '/reset') {
-      const sessionKey = getSessionKey(chatId, options.workDir)
+      const sessionKey = getSessionKey(chatId, options.workDir, options.profile)
       const hadSession = sessionMap.has(sessionKey)
       if (hadSession) {
         sessionMap.delete(sessionKey)
@@ -354,6 +360,15 @@ export async function startBot(options: StartBotOptions): Promise<void> {
     }
 
     try {
+      // 立即回复"收到"，让用户知道消息已被接收，避免等待焦虑
+      if (callback.sessionWebhook) {
+        await fetch(callback.sessionWebhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ msgtype: 'text', text: { content: '👍 收到，正在处理...' } }),
+        }).catch((error) => log(`[reply] Failed to send ack: ${error}`))
+      }
+
       // 调用 Claude Code CLI 处理消息，传入工作目录和会话类型
       // 使用 senderStaffId 作为私聊发消息的 userId（staffId 格式，非 senderId）
       const staffId = callback.senderStaffId || ''
