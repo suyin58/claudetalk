@@ -261,12 +261,80 @@ async function interactiveSetup(saveToLocal: boolean, workDir: string, profile?:
     const modelInput = await promptInput('  模型 (默认: claude-sonnet-4-6): ')
     subagentModel = modelInput || 'claude-sonnet-4-6'
     
-    // 可以进一步引导权限配置
+    // 引导用户配置权限
     const configPermissionsInput = await promptInput('  是否自定义权限？(y/N): ')
     if (configPermissionsInput.toLowerCase() === 'y') {
-      // 引导用户配置权限
-      console.log('   权限配置功能开发中，暂不支持自定义权限。')
-      // TODO: 实现权限配置引导
+      console.log('')
+      console.log('   请选择权限模板：')
+      console.log('   1. 开发者（全权限）- 可读写代码、运行测试、构建、发布')
+      console.log('   2. 开发者（限制发布）- 可读写代码、运行测试、构建，但禁止发布')
+      console.log('   3. 只读（代码审查）- 只能读取代码，禁止任何修改和运行命令')
+      console.log('   4. 文档编写者 - 只能修改文档文件，禁止修改源代码')
+      console.log('   5. 自定义（手动输入）')
+      
+      const templateChoice = await promptInput('   请输入选项 (1-5, 默认 2): ')
+      const choice = templateChoice || '2'
+      
+      switch (choice) {
+        case '1':
+          subagentPermissions = {
+            allow: ['Read(./**)', 'Edit(./**)', 'Bash(*)'],
+            deny: []
+          }
+          break
+        case '2':
+          subagentPermissions = {
+            allow: ['Read(./**)', 'Edit(./**)', 'Bash(npm test)', 'Bash(npm run build)', 'Bash(npm run dev)'],
+            deny: ['Bash(npm publish)', 'Bash(rm -rf *)']
+          }
+          break
+        case '3':
+          subagentPermissions = {
+            allow: ['Read(./**)'],
+            deny: ['Edit(./**)', 'Bash(*)']
+          }
+          break
+        case '4':
+          subagentPermissions = {
+            allow: ['Read(./**)', 'Edit(./README.md)', 'Edit(./docs/**)', 'Edit(./**/*.md)'],
+            deny: ['Edit(./src/**)', 'Edit(./**/*.ts)', 'Edit(./**/*.js)', 'Edit(./**/*.tsx)', 'Edit(./**/*.jsx)', 'Bash(*)']
+          }
+          break
+        case '5':
+          console.log('   请输入允许的权限规则（每行一个，空行结束）：')
+          console.log('   示例: Read(./**), Edit(./src/**), Bash(npm test)')
+          const allowRules: string[] = []
+          while (true) {
+            const rule = await promptInput('   allow> ')
+            if (!rule) break
+            allowRules.push(rule)
+          }
+          console.log('   请输入禁止的权限规则（每行一个，空行结束）：')
+          console.log('   示例: Bash(rm -rf *), Bash(npm publish)')
+          const denyRules: string[] = []
+          while (true) {
+            const rule = await promptInput('   deny> ')
+            if (!rule) break
+            denyRules.push(rule)
+          }
+          subagentPermissions = {
+            allow: allowRules.length > 0 ? allowRules : undefined,
+            deny: denyRules.length > 0 ? denyRules : undefined
+          }
+          break
+        default:
+          console.log('   ⚠️ 无效选项，使用默认权限（开发者限制发布）')
+          subagentPermissions = {
+            allow: ['Read(./**)', 'Edit(./**)', 'Bash(npm test)', 'Bash(npm run build)'],
+            deny: ['Bash(npm publish)', 'Bash(rm -rf *)']
+          }
+      }
+    } else {
+      // 使用默认权限（开发者限制发布）
+      subagentPermissions = {
+        allow: ['Read(./**)', 'Edit(./**)', 'Bash(npm test)', 'Bash(npm run build)'],
+        deny: ['Bash(npm publish)', 'Bash(rm -rf *)']
+      }
     }
   }
 
