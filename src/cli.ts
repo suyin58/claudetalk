@@ -245,11 +245,48 @@ async function interactiveSetup(saveToLocal: boolean, workDir: string, profile?:
   )
   const systemPrompt = systemPromptInput === ' ' ? '' : (systemPromptInput || existingPrompt)
 
+  // 新增：SubAgent 配置引导
+  console.log('')
+  console.log('🤖 SubAgent 配置（推荐）')
+  console.log('   SubAgent 是 Claude Code 的原生角色机制，可以提供更精细的权限控制和模型选择。')
+  console.log('   如果不配置，将使用传统的 systemPrompt 方式。')
+  
+  const enableSubagentInput = await promptInput('是否配置 SubAgent？(Y/n): ')
+  const enableSubagent = enableSubagentInput.toLowerCase() !== 'n'
+  
+  let subagentModel: string | undefined
+  let subagentPermissions: any | undefined
+  
+  if (enableSubagent) {
+    const modelInput = await promptInput('  模型 (默认: claude-sonnet-4-6): ')
+    subagentModel = modelInput || 'claude-sonnet-4-6'
+    
+    // 可以进一步引导权限配置
+    const configPermissionsInput = await promptInput('  是否自定义权限？(y/N): ')
+    if (configPermissionsInput.toLowerCase() === 'y') {
+      // 引导用户配置权限
+      console.log('   权限配置功能开发中，暂不支持自定义权限。')
+      // TODO: 实现权限配置引导
+    }
+  }
+
   if (profile) {
     // 保存到 profiles.<profile> 字段
     const profileConfig: ProfileConfig = { DINGTALK_CLIENT_ID: clientId, DINGTALK_CLIENT_SECRET: clientSecret }
     if (systemPrompt) profileConfig.systemPrompt = systemPrompt
+    if (enableSubagent) {
+      // 将 subAgent 配置保存到 profile 中
+      profileConfig.subagentEnabled = true
+      if (subagentModel) profileConfig.subagentModel = subagentModel
+      if (subagentPermissions) profileConfig.subagentPermissions = subagentPermissions
+    }
     saveProfileToFile(profile, profileConfig, targetFile, targetDir)
+    
+    // 如果启用了 subAgent，自动创建 subAgent 文件
+    if (enableSubagent) {
+      await createSubagentFile(profile, workDir, systemPrompt, subagentModel, subagentPermissions)
+    }
+    
     console.log('')
     console.log(`✅ 角色 [${profile}] 配置已保存到 ${targetFile}`)
     console.log('')
@@ -271,6 +308,73 @@ async function interactiveSetup(saveToLocal: boolean, workDir: string, profile?:
     console.log('')
     return config
   }
+}
+
+/**
+ * 创建 SubAgent 配置文件
+ */
+async function createSubagentFile(
+  profileName: string,
+  workDir: string,
+  systemPrompt?: string,
+  model?: string,
+  permissions?: any
+): Promise<void> {
+  const agentsDir = join(workDir, '.claude', 'agents')
+  if (!existsSync(agentsDir)) {
+    mkdirSync(agentsDir, { recursive: true })
+  }
+  
+  const agentFile = join(agentsDir, `${profileName}.md`)
+  
+  // 构建 YAML frontmatter
+  const yamlFrontmatter: string[] = ['---']
+  yamlFrontmatter.push(`name: "${profileName}"`)
+  yamlFrontmatter.push(`description: "ClaudeTalk 角色: ${profileName}"`)
+  if (model) {
+    yamlFrontmatter.push(`model: "${model}"`)
+  }
+  
+  if (permissions) {
+    yamlFrontmatter.push('permissions:')
+    // 处理权限配置
+    if (permissions.allow && permissions.allow.length > 0) {
+      yamlFrontmatter.push('  allow:')
+      permissions.allow.forEach((rule: string) => {
+        yamlFrontmatter.push(`    - "${rule}"`)
+      })
+    }
+    if (permissions.deny && permissions.deny.length > 0) {
+      yamlFrontmatter.push('  deny:')
+      permissions.deny.forEach((rule: string) => {
+        yamlFrontmatter.push(`    - "${rule}"`)
+      })
+    }
+  } else {
+    // 默认权限
+    yamlFrontmatter.push('permissions:')
+    yamlFrontmatter.push('  allow:')
+    yamlFrontmatter.push('    - "Read(./**)"')
+    yamlFrontmatter.push('    - "Edit(./**)"')
+    yamlFrontmatter.push('    - "Bash(npm test)"')
+    yamlFrontmatter.push('    - "Bash(npm run build)"')
+    yamlFrontmatter.push('  deny:')
+    yamlFrontmatter.push('    - "Bash(rm -rf *)"')
+    yamlFrontmatter.push('    - "Bash(npm publish)"')
+  }
+  
+  yamlFrontmatter.push('---')
+  yamlFrontmatter.push('')
+  
+  // 添加系统提示词
+  if (systemPrompt) {
+    yamlFrontmatter.push(systemPrompt)
+  } else {
+    yamlFrontmatter.push(`你是 ${profileName} 角色，负责相关工作。`)
+  }
+  
+  writeFileSync(agentFile, yamlFrontmatter.join('\n') + '\n', 'utf-8')
+  console.log(`✅ SubAgent 文件已创建: ${agentFile}`)
 }
 
 /**
@@ -344,6 +448,9 @@ ClaudeTalk - 钉钉机器人接入 Claude Code
   let clientSecret = ''
   let systemPrompt = ''
   let configSource = '环境变量'
+  let subagentEnabled = false
+  let subagentModel: string | undefined
+  let subagentPermissions: any | undefined
 
   const localConfigFile = join(workDir, LOCAL_CONFIG_FILENAME)
   const localConfig = loadConfigFromFile(localConfigFile, profile)
@@ -354,11 +461,21 @@ ClaudeTalk - 钉钉机器人接入 Claude Code
     clientSecret = localConfig.DINGTALK_CLIENT_SECRET
     systemPrompt = localConfig.systemPrompt || ''
     configSource = localConfigFile
+    // 读取 SubAgent 相关配置
+    const profileConfig = profile ? localConfig.profiles?.[profile] : localConfig
+    subagentEnabled = profileConfig?.subagentEnabled ?? false
+    subagentModel = profileConfig?.subagentModel
+    subagentPermissions = profileConfig?.subagentPermissions
   } else if (globalConfig) {
     clientId = globalConfig.DINGTALK_CLIENT_ID
     clientSecret = globalConfig.DINGTALK_CLIENT_SECRET
     systemPrompt = globalConfig.systemPrompt || ''
     configSource = GLOBAL_CONFIG_FILE
+    // 读取 SubAgent 相关配置
+    const profileConfig = profile ? globalConfig.profiles?.[profile] : globalConfig
+    subagentEnabled = profileConfig?.subagentEnabled ?? false
+    subagentModel = profileConfig?.subagentModel
+    subagentPermissions = profileConfig?.subagentPermissions
   }
 
   // 2. 指定了 profile 但找不到对应配置时，直接报错退出（不降级到环境变量）
@@ -432,6 +549,9 @@ ClaudeTalk - 钉钉机器人接入 Claude Code
     workDir,
     profile,
     systemPrompt,
+    subagentEnabled,
+    subagentModel,
+    subagentPermissions,
   })
 }
 

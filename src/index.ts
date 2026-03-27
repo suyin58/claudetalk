@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { DingTalkClient } from './dingtalk.js'
-import type { DingTalkChannelConfig, DingTalkInboundCallback } from './types.js'
+import type { DingTalkChannelConfig, DingTalkInboundCallback, ProfileConfig } from './types.js'
 
 export interface StartBotOptions {
   clientId: string
@@ -19,6 +19,10 @@ export interface StartBotOptions {
   profile?: string
   // 可选：角色描述，新建 session 时通过 --append-system-prompt 传给 Claude
   systemPrompt?: string
+  // SubAgent 相关配置
+  subagentEnabled?: boolean
+  subagentModel?: string
+  subagentPermissions?: any
 }
 
 // ========== 日志 ==========
@@ -40,6 +44,7 @@ interface SessionEntry {
   isGroup: boolean      // 是否群聊，发通知时需要
   conversationId: string
   userId: string        // 私聊时的发送者 userId，用于主动发消息
+  subagentEnabled: boolean  // 记录创建时的配置，用于检测配置变化
 }
 
 /**
@@ -127,6 +132,60 @@ interface ClaudeResponse {
   duration_ms: number
   stop_reason: string
 }
+
+/**
+ * 加载配置文件
+ */
+function loadConfigFromFile(filePath: string, profile?: string): any | null {
+  if (!existsSync(filePath)) {
+    return null
+  }
+  try {
+    const content = readFileSync(filePath, 'utf-8')
+    const raw = JSON.parse(content)
+
+    // 指定了 profile 但该 profile 不存在时，直接返回 null
+    if (profile && !raw.profiles?.[profile]) {
+      return null
+    }
+
+    // 合并顶层配置和指定 profile 的配置（profile 字段优先）
+    const profileOverride = profile ? (raw.profiles?.[profile] ?? {}) : {}
+    const merged = {
+      ...raw,
+      ...profileOverride,
+      profiles: raw.profiles,
+    }
+
+    return merged
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 按优先级加载配置
+ */
+function loadConfig(workDir: string, profile?: string): any | null {
+  const GLOBAL_CONFIG_DIR = join(homedir(), '.claudetalk')
+  const GLOBAL_CONFIG_FILE = join(GLOBAL_CONFIG_DIR, 'claudetalk.json')
+  const LOCAL_CONFIG_FILENAME = '.claudetalk.json'
+
+  // 优先级 1：工作目录本地配置
+  const localConfigFile = join(workDir, LOCAL_CONFIG_FILENAME)
+  const localConfig = loadConfigFromFile(localConfigFile, profile)
+  if (localConfig) {
+    return localConfig
+  }
+
+  // 优先级 2：全局配置
+  const globalConfig = loadConfigFromFile(GLOBAL_CONFIG_FILE, profile)
+  if (globalConfig) {
+    return globalConfig
+  }
+
+  return null
+}
 /**
  * 调用 claude -p CLI 处理消息
  * 如果有已存在的 session_id，则用 --resume 继续会话
@@ -139,25 +198,50 @@ async function callClaude(
   isGroup: boolean = false,
   userId: string = '',
   profile?: string,
-  systemPrompt?: string
+  systemPrompt?: string,
+  subagentEnabled?: boolean,
+  subagentModel?: string,
+  subagentPermissions?: any
 ): Promise<string> {
   const sessionKey = getSessionKey(conversationId, workDir, profile)
   const existingEntry = sessionMap.get(sessionKey)
   const existingSessionId = existingEntry?.sessionId
 
+  // 🔥 每次都重新读取最新配置
+  const currentConfig = loadConfig(workDir, profile)
+  const currentSubagentEnabled = currentConfig?.subagentEnabled ?? false
+  const currentSubagentModel = currentConfig?.subagentModel
+  const currentSystemPrompt = currentConfig?.systemPrompt
+
   const args = ['-p', '--output-format', 'json', '--dangerously-skip-permissions']
-  // 新建 session 时传入角色信息；resume 时 Claude 已有上下文，不需要重复传
-  if (!existingSessionId && systemPrompt) {
-    args.push('--append-system-prompt', systemPrompt)
-  }
-  if (existingSessionId) {
+  
+  if (existingSessionId && existingEntry) {
+    // 检查配置是否变化
+    if (existingEntry.subagentEnabled !== currentSubagentEnabled) {
+      log(`[session] Config changed for profile ${profile} (subagentEnabled: ${existingEntry.subagentEnabled} -> ${currentSubagentEnabled}), clearing old session`)
+      sessionMap.delete(sessionKey)
+      saveSessionMap()
+      // 递归调用，创建新 session
+      return callClaude(message, conversationId, workDir, isGroup, userId, profile, systemPrompt, currentSubagentEnabled, currentSubagentModel, subagentPermissions)
+    }
+    
+    // 配置未变化，恢复 session
     args.push('--resume', existingSessionId)
+  } else {
+    // 新建 session：使用最新配置
+    if (profile && currentSubagentEnabled) {
+      args.push('--agent', profile)
+    } else if (profile && !currentSubagentEnabled && currentSystemPrompt) {
+      args.push('--append-system-prompt', currentSystemPrompt)
+    } else if (!profile && currentSystemPrompt) {
+      args.push('--append-system-prompt', currentSystemPrompt)
+    }
   }
 
   if (existingSessionId) {
     log(`[claude] Resuming session: claude ${args.join(' ')}, cwd=${workDir}`)
   } else {
-    // 新建 session，打印完整命令（含 --append-system-prompt 内容，方便确认角色是否生效）
+    // 新建 session，打印完整命令（含 --agent 或 --append-system-prompt 内容，方便确认角色是否生效）
     const fullCommand = `claude ${args.join(' ')}`
     log(`[claude] New session: ${fullCommand}, cwd=${workDir}`)
   }
@@ -262,6 +346,7 @@ async function callClaude(
             isGroup,
             conversationId,
             userId,
+            subagentEnabled: currentSubagentEnabled,
           })
           saveSessionMap()
           log(`[claude] Saved session_id=${response.session_id} for sessionKey=${sessionKey}`)
@@ -372,7 +457,7 @@ export async function startBot(options: StartBotOptions): Promise<void> {
       // 调用 Claude Code CLI 处理消息，传入工作目录和会话类型
       // 使用 senderStaffId 作为私聊发消息的 userId（staffId 格式，非 senderId）
       const staffId = callback.senderStaffId || ''
-      const replyText = await callClaude(messageText, chatId, options.workDir, isGroup, staffId, options.profile, options.systemPrompt)
+      const replyText = await callClaude(messageText, chatId, options.workDir, isGroup, staffId, options.profile, options.systemPrompt, options.subagentEnabled, options.subagentModel, options.subagentPermissions)
       log(`[onMessage] Claude reply (first 200 chars): "${replyText.substring(0, 200)}"`)
 
       // 优先用 sessionWebhook 回复（最简单可靠）

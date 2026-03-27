@@ -238,3 +238,17 @@ export interface ChannelState {
   /** 活跃的 AI 卡片 */
   activeCards: Map<string, AICardInstance>;
 }
+
+// ClaudeTalk Profile 配置
+export interface ProfileConfig {
+  DINGTALK_CLIENT_ID?: string
+  DINGTALK_CLIENT_SECRET?: string
+  systemPrompt?: string
+  // SubAgent 相关配置
+  subagentEnabled?: boolean
+  subagentModel?: string
+  subagentPermissions?: {
+    allow?: string[]
+    deny?: string[]
+  }
+}
