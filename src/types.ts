@@ -239,16 +239,82 @@ export interface ChannelState {
   activeCards: Map<string, AICardInstance>;
 }
 
-// ClaudeTalk Profile 配置
+// ========== Channel 抽象层 ==========
+
+/**
+ * 支持的消息通道类型
+ * 使用 string 而非联合类型，便于通过注册表动态扩展新 Channel，无需修改此文件
+ */
+export type ChannelType = string
+
+/** 跨 Channel 统一的消息上下文 */
+export interface ChannelMessageContext {
+  /** 会话 ID（钉钉 conversationId / Discord channelId） */
+  conversationId: string
+  /** 发送者 ID */
+  senderId: string
+  /** 是否群聊 */
+  isGroup: boolean
+  /** 用于私聊通知的用户标识（钉钉 staffId / Discord userId） */
+  userId: string
+}
+
+/** Channel 统一接口，钉钉和 Discord 各自完整实现 */
+export interface Channel {
+  /** 启动连接 */
+  start(): Promise<void>
+  /** 停止连接 */
+  stop(): void
+  /** 注册消息处理器 */
+  onMessage(handler: (context: ChannelMessageContext, message: string) => Promise<void>): void
+  /** 发送消息 */
+  sendMessage(conversationId: string, content: string, isGroup: boolean): Promise<void>
+  /** 发送上线通知（可选，各 Channel 自行实现） */
+  sendOnlineNotification?(userId: string, workDir: string): Promise<void>
+  /** 获取历史消息（Discord 专有，钉钉不支持） */
+  getHistoryMessages?(conversationId: string, limit?: number): Promise<string[]>
+}
+
+// ========== 配置层 ==========
+
+/** 钉钉 Channel 专属配置 */
+export interface DingTalkProfileConfig {
+  DINGTALK_CLIENT_ID: string
+  DINGTALK_CLIENT_SECRET: string
+}
+
+/** Discord Channel 专属配置 */
+export interface DiscordProfileConfig {
+  /** Bot Token */
+  TOKEN: string
+  /** Application Client ID */
+  CLIENT_ID?: string
+  /** 限定 Guild ID（可选，不填则响应所有 Guild） */
+  GUILD_ID?: string
+}
+
+/** ClaudeTalk Profile 配置 */
 export interface ProfileConfig {
-  DINGTALK_CLIENT_ID?: string
-  DINGTALK_CLIENT_SECRET?: string
+  /** 消息通道类型，必填 */
+  channel: ChannelType
+  /** 钉钉配置 */
+  dingtalk?: DingTalkProfileConfig
+  /** Discord 配置 */
+  discord?: DiscordProfileConfig
+  /** 角色系统提示词 */
   systemPrompt?: string
-  // SubAgent 相关配置
+  /** 是否启用 SubAgent */
   subagentEnabled?: boolean
+  /** SubAgent 使用的模型 */
   subagentModel?: string
+  /** SubAgent 权限配置 */
   subagentPermissions?: {
     allow?: string[]
     deny?: string[]
   }
+  /** 索引签名：支持动态 Channel 类型的嵌套配置（如 wechat、slack 等） */
+  [channelKey: string]: unknown
 }
+
+/** ClaudeTalk 配置文件结构（loadConfig 返回的合并后配置） */
+export interface ClaudeTalkConfig extends ProfileConfig {}

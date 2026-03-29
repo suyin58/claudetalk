@@ -3,6 +3,8 @@
  */
 
 import type {
+  Channel,
+  ChannelMessageContext,
   DingTalkChannelConfig,
   DingTalkTokenResponse,
   DingTalkSendResponse,
@@ -10,7 +12,8 @@ import type {
   AICardCreateRequest,
   AICardStreamingRequest,
   DingTalkInboundCallback,
-} from './types.js';
+} from '../types.js';
+import { registerChannel } from './registry.js';
 
 const DINGTALK_API_BASE = 'https://api.dingtalk.com';
 const DINGTALK_STREAM_URL = process.env.DINGTALK_STREAM_URL || 'wss://dingtalk-stream.dingtalk.com/connect';
@@ -36,16 +39,17 @@ interface DingTalkStreamFrame {
   data: string;
 }
 
-// 消息到达时的回调函数类型
-type MessageHandler = (callback: DingTalkInboundCallback) => Promise<void>;
+// 消息到达时的回调函数类型（内部使用，保留原始钉钉回调）
+type InternalMessageHandler = (callback: DingTalkInboundCallback) => Promise<void>;
 
 /**
- * 钉钉 API 客户端
+ * 钉钉 API 客户端，实现 Channel 接口
  */
-export class DingTalkClient {
+export class DingTalkClient implements Channel {
   private config: DingTalkChannelConfig;
   private tokenCache: { accessToken: string; expiresAt: number } | null = null;
-  private messageHandler: MessageHandler | null = null;
+  private internalMessageHandler: InternalMessageHandler | null = null;
+  private channelMessageHandler: ((context: ChannelMessageContext, message: string) => Promise<void>) | null = null;
   private ws: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private isManuallyClosed: boolean = false;
@@ -56,10 +60,29 @@ export class DingTalkClient {
   }
 
   /**
-   * 注册消息处理回调
+   * 注册 Channel 统一消息处理器（实现 Channel 接口）
    */
-  onMessage(handler: MessageHandler): void {
-    this.messageHandler = handler;
+  onMessage(handler: (context: ChannelMessageContext, message: string) => Promise<void>): void {
+    this.channelMessageHandler = handler;
+  }
+
+  /**
+   * 注册内部钉钉原始消息处理器（内部使用）
+   */
+  onRawMessage(handler: InternalMessageHandler): void {
+    this.internalMessageHandler = handler;
+  }
+
+  /**
+   * 发送上线通知（实现 Channel 接口）
+   */
+  async sendOnlineNotification(userId: string, workDir: string): Promise<void> {
+    const notifyText = `✅ ClaudeTalk 已上线\n📁 工作目录: ${workDir}`;
+    try {
+      await this.sendPrivateMessage(userId, notifyText, 'sampleText');
+    } catch (error) {
+      console.error(`[notify] Failed to send online notification: ${error}`);
+    }
   }
 
   /**
@@ -369,29 +392,33 @@ export class DingTalkClient {
 
     console.error(`Received message from ${callback.senderId} in ${callback.conversationId}: ${messageText}`);
 
-    if (this.messageHandler) {
-      await this.messageHandler(callback);
+    if (this.channelMessageHandler) {
+      const context: ChannelMessageContext = {
+        conversationId: callback.conversationId,
+        senderId: callback.senderId,
+        isGroup,
+        userId: callback.senderStaffId || '',
+      };
+      await this.channelMessageHandler(context, messageText);
     }
   }
 
   /**
-   * 发送消息（自动判断私聊/群聊，自动选择消息类型）
+   * 发送消息（实现 Channel 接口，自动判断私聊/群聊，自动选择消息类型）
    */
   async sendMessage(
     conversationId: string,
     content: string,
     isGroup: boolean
-  ): Promise<DingTalkSendResponse> {
+  ): Promise<void> {
     const messageType = this.config.messageType || 'markdown';
 
     if (messageType === 'card' && this.config.cardTemplateId) {
-      // AI 卡片模式
-      const card = await this.createAICard(conversationId, content);
-      return { errcode: 0, errmsg: 'ok', processQueryKeys: [card.processQueryKey] };
+      await this.createAICard(conversationId, content);
+      return;
     }
 
-    // 默认 Markdown 模式
-    return this.sendMarkdownMessage(conversationId, content, isGroup);
+    await this.sendMarkdownMessage(conversationId, content, isGroup);
   }
 
   /**
@@ -458,22 +485,58 @@ export class DingTalkClient {
 
   /**
    * 发送 Markdown 消息
+   * 注意：不能复用 sendGroupMessage/sendPrivateMessage，因为它们会把 content 包成 { content: ... }，
+   * 而 sampleMarkdown 的 msgParam 格式是 { title, text }，需要直接构造请求体。
    */
   async sendMarkdownMessage(
     conversationId: string,
     content: string,
     isGroup: boolean
   ): Promise<DingTalkSendResponse> {
+    const accessToken = await this.getAccessToken();
+    const robotCode = this.config.robotCode || this.config.clientId;
     const msgKey = 'sampleMarkdown';
-    const msgParam = {
+    const msgParam = JSON.stringify({
       title: 'Claude Code',
       text: content,
-    };
+    });
 
     if (isGroup) {
-      return this.sendGroupMessage(conversationId, JSON.stringify(msgParam), msgKey);
+      const response = await fetch(
+        `${DINGTALK_API_BASE}/v1.0/robot/groupMessages/send`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-acs-dingtalk-access-token': accessToken,
+          },
+          body: JSON.stringify({
+            robotCode,
+            openConversationId: conversationId,
+            msgKey,
+            msgParam,
+          }),
+        }
+      );
+      return response.json();
     } else {
-      return this.sendPrivateMessage(conversationId, JSON.stringify(msgParam), msgKey);
+      const response = await fetch(
+        `${DINGTALK_API_BASE}/v1.0/robot/oToMessages/batchSend`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-acs-dingtalk-access-token': accessToken,
+          },
+          body: JSON.stringify({
+            robotCode,
+            userIds: [conversationId],
+            msgKey,
+            msgParam,
+          }),
+        }
+      );
+      return response.json();
     }
   }
 
@@ -662,3 +725,31 @@ export class DingTalkClient {
     }
   }
 }
+
+// ========== Channel 自注册 ==========
+
+registerChannel({
+  type: 'dingtalk',
+  label: '钉钉机器人',
+  configFields: [
+    {
+      key: 'DINGTALK_CLIENT_ID',
+      label: 'DINGTALK_CLIENT_ID (AppKey)',
+      required: true,
+      hint: '在钉钉开放平台 (https://open-dev.dingtalk.com) 创建应用获取',
+    },
+    {
+      key: 'DINGTALK_CLIENT_SECRET',
+      label: 'DINGTALK_CLIENT_SECRET (AppSecret)',
+      required: true,
+      secret: true,
+    },
+  ],
+  create(config) {
+    return new DingTalkClient({
+      clientId: config.DINGTALK_CLIENT_ID,
+      clientSecret: config.DINGTALK_CLIENT_SECRET,
+      robotCode: config.DINGTALK_CLIENT_ID,
+    })
+  },
+})

@@ -29,5 +29,11 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/suyin58/claudetalk.git"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.1"
+  },
+  "overrides": {
+    "undici": "^7.0.0"
   }
 }

@@ -1,129 +1,29 @@
 #!/usr/bin/env node
 /**
- * ClaudeTalk CLI - 钉钉机器人接入 Claude Code
+ * ClaudeTalk CLI - 多 Channel 机器人接入 Claude Code
  * 通过 claudetalk 命令启动，自动管理配置文件
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
-import { homedir } from 'os'
 import { join } from 'path'
 import { createInterface } from 'readline'
+import { getAllChannelDescriptors, getChannelDescriptor } from './channels/index.js'
+import { startBot } from './index.js'
+import type { ProfileConfig } from './types.js'
 
-// ========== 配置文件管理 ==========
-const GLOBAL_CONFIG_DIR = join(homedir(), '.claudetalk')
-const GLOBAL_CONFIG_FILE = join(GLOBAL_CONFIG_DIR, 'claudetalk.json')
-// 兼容旧路径
-const CONFIG_DIR = GLOBAL_CONFIG_DIR
-const CONFIG_FILE = GLOBAL_CONFIG_FILE
-
-// 工作目录下的本地配置文件名
+// ========== 配置文件路径 ==========
 const LOCAL_CONFIG_FILENAME = '.claudetalk.json'
 
-interface ProfileConfig {
-  DINGTALK_CLIENT_ID?: string
-  DINGTALK_CLIENT_SECRET?: string
-  systemPrompt?: string
-  subagentEnabled?: boolean
-  subagentModel?: string
-  subagentPermissions?: {
-    allow?: string[]
-    deny?: string[]
-  }
-}
+// ========== 配置类型 ==========
 
-interface ClaudeTalkConfig {
-  DINGTALK_CLIENT_ID: string
-  DINGTALK_CLIENT_SECRET: string
-  systemPrompt?: string
-  // SubAgent 相关配置（合并后的顶层字段）
-  subagentEnabled?: boolean
-  subagentModel?: string
-  subagentPermissions?: {
-    allow?: string[]
-    deny?: string[]
-  }
-  // 多角色配置：key 为角色名，value 为该角色的配置（会覆盖顶层字段）
+interface RawConfig {
   profiles?: Record<string, ProfileConfig>
 }
 
-/**
- * 从指定路径加载配置文件，按 profile 解析后返回有效配置或 null
- * @param filePath 配置文件路径
- * @param profile 角色名，不传则使用顶层默认配置
- */
-function loadConfigFromFile(filePath: string, profile?: string): ClaudeTalkConfig | null {
-  if (!existsSync(filePath)) {
-    return null
-  }
-  try {
-    const content = readFileSync(filePath, 'utf-8')
-    const raw = JSON.parse(content) as ClaudeTalkConfig
-
-    // 指定了 profile 但该 profile 不存在时，直接返回 null（不降级到顶层默认配置）
-    if (profile && !raw.profiles?.[profile]) {
-      return null
-    }
-
-    // 合并顶层配置和指定 profile 的配置（profile 字段优先）
-    const profileOverride = profile ? (raw.profiles?.[profile] ?? {}) : {}
-    const merged: ClaudeTalkConfig = {
-      ...raw,
-      ...profileOverride,
-      // profiles 字段本身不需要透传
-      profiles: raw.profiles,
-    }
-
-    if (merged.DINGTALK_CLIENT_ID && merged.DINGTALK_CLIENT_SECRET) {
-      return merged
-    }
-    return null
-  } catch {
-    return null
-  }
-}
-
-/**
- * 按优先级加载配置：
- * 1. 工作目录下的 .claudetalk.json（最高优先级，支持多目录不同机器人）
- * 2. 全局 ~/.claudetalk/claudetalk.json
- * 返回配置内容和来源路径，方便启动时展示
- */
-function loadConfig(workDir: string): { config: ClaudeTalkConfig; source: string } | null {
-  // 优先级 1：工作目录本地配置
-  const localConfigFile = join(workDir, LOCAL_CONFIG_FILENAME)
-  const localConfig = loadConfigFromFile(localConfigFile)
-  if (localConfig) {
-    return { config: localConfig, source: localConfigFile }
-  }
-
-  // 优先级 2：全局配置
-  const globalConfig = loadConfigFromFile(GLOBAL_CONFIG_FILE)
-  if (globalConfig) {
-    return { config: globalConfig, source: GLOBAL_CONFIG_FILE }
-  }
-
-  return null
-}
-
-/**
- * 保存配置到指定路径
- */
-function saveConfigToFile(config: ClaudeTalkConfig, filePath: string, dirPath: string): void {
-  if (!existsSync(dirPath)) {
-    mkdirSync(dirPath, { recursive: true })
-  }
-  writeFileSync(filePath, JSON.stringify(config, null, 2) + '\n', 'utf-8')
-}
-
-function saveConfig(config: ClaudeTalkConfig): void {
-  saveConfigToFile(config, GLOBAL_CONFIG_FILE, GLOBAL_CONFIG_DIR)
-}
+// ========== 工具函数 ==========
 
 function promptInput(question: string): Promise<string> {
-  const readline = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  })
+  const readline = createInterface({ input: process.stdin, output: process.stdout })
   return new Promise((resolve) => {
     readline.question(question, (answer) => {
       readline.close()
@@ -132,125 +32,106 @@ function promptInput(question: string): Promise<string> {
   })
 }
 
-/**
- * 将 profile 配置写入配置文件（合并到已有文件的 profiles 字段中）
- */
-function saveProfileToFile(
-  profileName: string,
-  profileConfig: ProfileConfig,
-  filePath: string,
-  dirPath: string
-): void {
-  if (!existsSync(dirPath)) {
-    mkdirSync(dirPath, { recursive: true })
+function loadRawConfig(filePath: string): RawConfig | null {
+  if (!existsSync(filePath)) return null
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf-8')) as RawConfig
+  } catch {
+    return null
   }
-
-  // 读取已有配置（如果存在），避免覆盖其他 profile
-  let existing: ClaudeTalkConfig = { DINGTALK_CLIENT_ID: '', DINGTALK_CLIENT_SECRET: '' }
-  if (existsSync(filePath)) {
-    try {
-      existing = JSON.parse(readFileSync(filePath, 'utf-8')) as ClaudeTalkConfig
-    } catch {
-      // 文件损坏则重建
-    }
-  }
-
-  const updated: ClaudeTalkConfig = {
-    ...existing,
-    profiles: {
-      ...(existing.profiles ?? {}),
-      [profileName]: profileConfig,
-    },
-  }
-  writeFileSync(filePath, JSON.stringify(updated, null, 2) + '\n', 'utf-8')
 }
 
-/**
- * 交互式配置向导
- * @param saveToLocal 是否保存到工作目录（true）还是全局目录（false）
- * @param workDir 当前工作目录（saveToLocal 为 true 时使用）
- * @param profile 角色名，不传则配置默认角色
- */
-async function interactiveSetup(saveToLocal: boolean, workDir: string, profile?: string): Promise<ClaudeTalkConfig> {
-  const targetFile = saveToLocal
-    ? join(workDir, LOCAL_CONFIG_FILENAME)
-    : GLOBAL_CONFIG_FILE
-  const targetDir = saveToLocal ? workDir : GLOBAL_CONFIG_DIR
+function saveRawConfig(config: RawConfig, filePath: string): void {
+  writeFileSync(filePath, JSON.stringify(config, null, 2) + '\n', 'utf-8')
+}
 
-  // 读取已有配置（如果存在），用于展示现有值和保留原值
-  const existingRaw = existsSync(targetFile)
-    ? (() => { try { return JSON.parse(readFileSync(targetFile, 'utf-8')) as ClaudeTalkConfig } catch { return null } })()
-    : null
-  const existingConfig = profile
-    ? (existingRaw?.profiles?.[profile] ?? null)
-    : existingRaw
+function parseProfileArg(): string | undefined {
+  const index = process.argv.indexOf('--profile')
+  if (index !== -1 && process.argv[index + 1]) return process.argv[index + 1]
+  return undefined
+}
+
+// ========== 交互式配置向导 ==========
+
+async function interactiveSetup(workDir: string, profile?: string): Promise<void> {
+  const targetFile = join(workDir, LOCAL_CONFIG_FILENAME)
+
+  // 没有指定 profile 时使用 "default" 作为默认角色名
+  const resolvedProfile = profile ?? 'default'
+
+  const existingRaw = loadRawConfig(targetFile)
+  const existingProfile = existingRaw?.profiles?.[resolvedProfile]
 
   console.log('')
   console.log('🤖 ClaudeTalk 配置向导')
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-  console.log('')
-  if (profile) {
-    console.log(`🎭 角色: ${profile}`)
-  }
-  if (saveToLocal) {
-    console.log(`📁 配置将保存到当前工作目录: ${targetFile}`)
-    console.log('   （此配置仅对当前目录生效，优先级高于全局配置）')
-  } else {
-    console.log(`🌐 配置将保存到全局目录: ${targetFile}`)
-    console.log('   （此配置对所有未设置本地配置的目录生效）')
-  }
-
-  if (existingConfig) {
-    const existingId = (existingConfig as ClaudeTalkConfig).DINGTALK_CLIENT_ID || (existingConfig as ProfileConfig).DINGTALK_CLIENT_ID || ''
-    const existingSecret = (existingConfig as ClaudeTalkConfig).DINGTALK_CLIENT_SECRET || (existingConfig as ProfileConfig).DINGTALK_CLIENT_SECRET || ''
-    const existingPrompt = (existingConfig as ClaudeTalkConfig).systemPrompt || (existingConfig as ProfileConfig).systemPrompt || ''
-    console.log('')
-    console.log('📋 当前已有配置（直接回车保留原值）:')
-    if (existingId) console.log(`   DINGTALK_CLIENT_ID    : ${existingId}`)
-    if (existingSecret) console.log(`   DINGTALK_CLIENT_SECRET: ${existingSecret.substring(0, 4)}****`)
-    if (existingPrompt) console.log(`   systemPrompt          : ${existingPrompt.substring(0, 60)}${existingPrompt.length > 60 ? '...' : ''}`)
-  } else {
-    console.log('')
-    console.log('请提供钉钉机器人的 AppKey 和 AppSecret。')
-    console.log('你可以在钉钉开放平台 (https://open-dev.dingtalk.com) 创建应用并获取。')
-  }
+  console.log(`🎭 角色: ${resolvedProfile}`)
+  console.log(`📁 配置文件: ${targetFile}`)
   console.log('')
 
-  const existingId = (existingConfig as ClaudeTalkConfig | null)?.DINGTALK_CLIENT_ID || (existingConfig as ProfileConfig | null)?.DINGTALK_CLIENT_ID || ''
-  const existingSecret = (existingConfig as ClaudeTalkConfig | null)?.DINGTALK_CLIENT_SECRET || (existingConfig as ProfileConfig | null)?.DINGTALK_CLIENT_SECRET || ''
-  const existingPrompt = (existingConfig as ClaudeTalkConfig | null)?.systemPrompt || (existingConfig as ProfileConfig | null)?.systemPrompt || ''
-
-  const clientIdInput = await promptInput(
-    existingId
-      ? `DINGTALK_CLIENT_ID (AppKey) [${existingId}]: `
-      : '请输入 DINGTALK_CLIENT_ID (AppKey): '
+  // 1. 选择 Channel 类型（从注册表动态生成选项）
+  const allChannels = getAllChannelDescriptors()
+  const existingChannel = existingProfile?.channel as string | undefined
+  console.log('📡 消息通道选择:')
+  allChannels.forEach((ch, index) => {
+    console.log(`   ${index + 1}. ${ch.type.padEnd(10)} - ${ch.label}`)
+  })
+  const channelInput = await promptInput(
+    existingChannel ? `请选择 (1-${allChannels.length}) [${existingChannel}]: ` : `请选择 (1-${allChannels.length}): `
   )
-  const clientId = clientIdInput || existingId
-  if (!clientId) {
-    console.error('❌ DINGTALK_CLIENT_ID 不能为空')
+  let channelType: string
+  const channelIndexInput = parseInt(channelInput, 10)
+  if (!isNaN(channelIndexInput) && channelIndexInput >= 1 && channelIndexInput <= allChannels.length) {
+    channelType = allChannels[channelIndexInput - 1].type
+  } else if (!channelInput && existingChannel) {
+    channelType = existingChannel
+  } else if (channelInput && getChannelDescriptor(channelInput)) {
+    channelType = channelInput
+  } else {
+    console.error(`❌ 请输入 1 到 ${allChannels.length} 之间的数字`)
     process.exit(1)
   }
 
-  const clientSecretInput = await promptInput(
-    existingSecret
-      ? `DINGTALK_CLIENT_SECRET (AppSecret) [${existingSecret.substring(0, 4)}****]: `
-      : '请输入 DINGTALK_CLIENT_SECRET (AppSecret): '
-  )
-  const clientSecret = clientSecretInput || existingSecret
-  if (!clientSecret) {
-    console.error('❌ DINGTALK_CLIENT_SECRET 不能为空')
-    process.exit(1)
-  }
+  // 2. 根据 Channel 类型引导配置（从注册表 configFields 动态生成）
+  const descriptor = getChannelDescriptor(channelType)!
+  const existingChannelConfig = (existingProfile?.[channelType] ?? {}) as Record<string, string>
+  const channelConfig: Record<string, string> = {}
 
   console.log('')
-  console.log('📝 角色描述（可选）')
-  console.log('   设置后，Claude 在每次新建会话时会了解你的要求。')
-  console.log('   示例: "你在这里面负责什么？有什么特别的要求？"')
-  if (existingPrompt) {
-    console.log('   直接回车保留原值，输入空格后回车可清除。')
-  } else {
-    console.log('   直接回车跳过。')
+  console.log(`🔑 ${descriptor.label}配置`)
+  if (descriptor.configFields.some(f => f.hint)) {
+    console.log(`   ${descriptor.configFields.find(f => f.hint)?.hint}`)
   }
+
+  for (const field of descriptor.configFields) {
+    const existingValue = existingChannelConfig[field.key]
+    let prompt: string
+    if (existingValue) {
+      const displayValue = field.secret
+        ? `${existingValue.substring(0, 4)}****`
+        : existingValue
+      prompt = `${field.label} [${displayValue}]: `
+    } else {
+      prompt = `${field.label}: `
+    }
+
+    const inputValue = await promptInput(prompt)
+    const finalValue = inputValue || existingValue || ''
+
+    if (field.required && !finalValue) {
+      console.error(`❌ ${field.label} 不能为空`)
+      process.exit(1)
+    }
+
+    if (finalValue) {
+      channelConfig[field.key] = finalValue
+    }
+  }
+
+  // 3. 角色描述（systemPrompt）
+  console.log('')
+  console.log('📝 角色描述（可选，直接回车跳过）')
+  const existingPrompt = existingProfile?.systemPrompt || ''
   const systemPromptInput = await promptInput(
     existingPrompt
       ? `systemPrompt [${existingPrompt.substring(0, 40)}${existingPrompt.length > 40 ? '...' : ''}]: `
@@ -258,85 +139,57 @@ async function interactiveSetup(saveToLocal: boolean, workDir: string, profile?:
   )
   const systemPrompt = systemPromptInput === ' ' ? '' : (systemPromptInput || existingPrompt)
 
-  // 新增：SubAgent 配置引导
+  // 4. SubAgent 配置
   console.log('')
-  console.log('🤖 SubAgent 配置（推荐）')
+  console.log('🤖 SubAgent 配置（可选）')
   console.log('   SubAgent 是 Claude Code 的原生角色机制，可以提供更精细的权限控制和模型选择。')
-  console.log('   如果不配置，将使用传统的 systemPrompt 方式。')
-  
   const enableSubagentInput = await promptInput('是否配置 SubAgent？(Y/n): ')
   const enableSubagent = enableSubagentInput.toLowerCase() !== 'n'
-  
-  let subagentModel: string | undefined
 
+  let subagentModel: string | undefined
   if (enableSubagent) {
     console.log('')
     console.log('  📦 模型选择（直接回车使用 Claude Code 默认模型）：')
-    console.log('     1. claude-opus-4-5    - 最强推理，适合复杂任务（较慢，费用高）')
-    console.log('     2. claude-sonnet-4-5  - 均衡性能，适合日常开发（推荐）')
-    console.log('     3. claude-haiku-4-5   - 速度最快，适合简单问答（费用低）')
+    console.log('     1. claude-opus-4-5    - 最强推理（较慢，费用高）')
+    console.log('     2. claude-sonnet-4-5  - 均衡性能（推荐）')
+    console.log('     3. claude-haiku-4-5   - 速度最快（费用低）')
     console.log('     4. 手动输入其他模型名称')
     const modelChoice = await promptInput('  请输入选项 (1-4，直接回车使用默认): ')
     switch (modelChoice.trim()) {
-      case '1':
-        subagentModel = 'claude-opus-4-5'
-        break
-      case '2':
-        subagentModel = 'claude-sonnet-4-5'
-        break
-      case '3':
-        subagentModel = 'claude-haiku-4-5'
-        break
+      case '1': subagentModel = 'claude-opus-4-5'; break
+      case '2': subagentModel = 'claude-sonnet-4-5'; break
+      case '3': subagentModel = 'claude-haiku-4-5'; break
       case '4': {
         const customModel = await promptInput('  请输入模型名称: ')
         subagentModel = customModel.trim() || undefined
         break
       }
-      default:
-        // 直接回车：不设置 subagentModel，Claude Code 使用其自身默认模型
-        subagentModel = undefined
     }
 
-    // 权限默认全部允许，用户可在生成的 SubAgent 文件中手动调整
+    // 自动创建 SubAgent 文件
+    await createSubagentFile(resolvedProfile, process.cwd(), systemPrompt, subagentModel)
   }
 
-  if (profile) {
-    // 保存到 profiles.<profile> 字段
-    const profileConfig: ProfileConfig = { DINGTALK_CLIENT_ID: clientId, DINGTALK_CLIENT_SECRET: clientSecret }
-    if (systemPrompt) profileConfig.systemPrompt = systemPrompt
-    if (enableSubagent) {
-      // 将 subAgent 配置保存到 profile 中
-      profileConfig.subagentEnabled = true
-      if (subagentModel) profileConfig.subagentModel = subagentModel
-    }
-    saveProfileToFile(profile, profileConfig, targetFile, targetDir)
-    
-    // 如果启用了 subAgent，自动创建 subAgent 文件
-    if (enableSubagent) {
-      await createSubagentFile(profile, workDir, systemPrompt, subagentModel)
-    }
-    
-    console.log('')
-    console.log(`✅ 角色 [${profile}] 配置已保存到 ${targetFile}`)
-    console.log('')
-    // 返回合并后的完整配置（兼容调用方）
-    return { DINGTALK_CLIENT_ID: clientId, DINGTALK_CLIENT_SECRET: clientSecret, systemPrompt }
-  } else {
-    // 保存为顶层默认配置
-    const existingFull = existingRaw ?? { DINGTALK_CLIENT_ID: '', DINGTALK_CLIENT_SECRET: '' }
-    const config: ClaudeTalkConfig = {
-      ...existingFull,
-      DINGTALK_CLIENT_ID: clientId,
-      DINGTALK_CLIENT_SECRET: clientSecret,
-    }
-    if (systemPrompt) config.systemPrompt = systemPrompt
-    else delete config.systemPrompt
-    saveConfigToFile(config, targetFile, targetDir)
-    console.log('')
-    console.log(`✅ 配置已保存到 ${targetFile}`)
-    console.log('')
-    return config
+  // 5. 保存配置
+  const profileConfig: ProfileConfig = {
+    channel: channelType,
+    [channelType]: channelConfig,
+    ...(systemPrompt ? { systemPrompt } : {}),
+    ...(enableSubagent ? { subagentEnabled: true } : {}),
+    ...(subagentModel ? { subagentModel } : {}),
   }
+
+  const updatedConfig: RawConfig = {
+    ...existingRaw,
+    profiles: {
+      ...(existingRaw?.profiles ?? {}),
+      [resolvedProfile]: profileConfig,
+    },
+  }
+
+  saveRawConfig(updatedConfig, targetFile)
+  console.log('')
+  console.log(`✅ 角色 [${resolvedProfile}] 配置已保存到 ${targetFile}`)
 }
 
 /**
@@ -349,219 +202,118 @@ async function createSubagentFile(
   model?: string
 ): Promise<void> {
   const agentsDir = join(workDir, '.claude', 'agents')
-  if (!existsSync(agentsDir)) {
-    mkdirSync(agentsDir, { recursive: true })
-  }
-  
+  if (!existsSync(agentsDir)) mkdirSync(agentsDir, { recursive: true })
+
   const agentFile = join(agentsDir, `${profileName}.md`)
-  
-  // 构建 YAML frontmatter
-  const yamlFrontmatter: string[] = ['---']
-  yamlFrontmatter.push(`name: "${profileName}"`)
-  yamlFrontmatter.push(`description: "ClaudeTalk 角色: ${profileName}"`)
-  if (model) {
-    yamlFrontmatter.push(`model: "${model}"`)
-  }
-  
-  // 权限默认全部允许（不设置 permissions 字段），如需限制可手动编辑此文件
-  // 示例：
-  //   permissions:
-  //     allow:
-  //       - "Read(./**)"
-  //       - "Edit(./src/**)"
-  //       - "Bash(npm test)"
-  //     deny:
-  //       - "Bash(rm -rf *)"
-  //       - "Bash(npm publish)"
+  const lines: string[] = ['---']
+  lines.push(`name: "${profileName}"`)
+  lines.push(`description: "ClaudeTalk 角色: ${profileName}"`)
+  if (model) lines.push(`model: "${model}"`)
+  lines.push('---')
+  lines.push('')
+  lines.push(systemPrompt ?? `你是 ${profileName} 角色，负责相关工作。`)
 
-  yamlFrontmatter.push('---')
-  yamlFrontmatter.push('')
-
-  // 添加系统提示词
-  if (systemPrompt) {
-    yamlFrontmatter.push(systemPrompt)
-  } else {
-    yamlFrontmatter.push(`你是 ${profileName} 角色，负责相关工作。`)
-  }
-  
-  writeFileSync(agentFile, yamlFrontmatter.join('\n') + '\n', 'utf-8')
+  writeFileSync(agentFile, lines.join('\n') + '\n', 'utf-8')
   console.log(`✅ SubAgent 文件已创建: ${agentFile}`)
 }
 
-/**
- * 从 process.argv 中解析 --profile <name> 的值
- */
-function parseProfileArg(): string | undefined {
-  const index = process.argv.indexOf('--profile')
-  if (index !== -1 && process.argv[index + 1]) {
-    return process.argv[index + 1]
-  }
-  return undefined
-}
-
 // ========== 主流程 ==========
+
 async function main(): Promise<void> {
   const workDir = process.cwd()
-  const isSetupLocal = process.argv.includes('--local')
   const profile = parseProfileArg()
 
-  // 处理 --help
+  // --help
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
     console.log(`
-ClaudeTalk - 钉钉机器人接入 Claude Code
+ClaudeTalk - 通过钉钉/Discord 机器人与 Claude Code 对话
 
 用法:
-  claudetalk                              启动默认角色机器人
-  claudetalk --profile <name>             启动指定角色机器人
-  claudetalk --setup                      配置全局默认凭据
-  claudetalk --setup --local              配置当前目录默认凭据
-  claudetalk --setup --local --profile <name>  配置当前目录指定角色
-  claudetalk --help                       显示帮助信息
+  claudetalk                                           启动机器人（使用默认角色）
+  claudetalk --profile <name>                          启动指定角色机器人
+  claudetalk --setup                                   配置当前目录默认角色
+  claudetalk --setup --profile <name>                  配置当前目录指定角色
+  claudetalk --help                                    显示帮助信息
 
-多角色配置示例（.claudetalk.json）:
+默认角色规则:
+  - 不指定 --profile 时，优先使用名为 "default" 的角色
+  - 如果没有 "default" 角色，但配置中只有一个角色，则自动使用该角色
+  - 如果有多个角色且没有 "default"，则必须通过 --profile 指定
+
+配置文件示例 (.claudetalk.json):
   {
-    "DINGTALK_CLIENT_ID": "默认机器人 AppKey",
-    "DINGTALK_CLIENT_SECRET": "默认机器人 AppSecret",
     "profiles": {
-      "pm": {
-        "DINGTALK_CLIENT_ID": "PM 机器人 AppKey",
-        "DINGTALK_CLIENT_SECRET": "PM 机器人 AppSecret",
-        "systemPrompt": "你在这里面负责产品需求，还负责任务拆解，按照业务要求制定工作计划"
+      "default": {
+        "channel": "dingtalk",
+        "dingtalk": {
+          "DINGTALK_CLIENT_ID": "xxx",
+          "DINGTALK_CLIENT_SECRET": "xxx"
+        },
+        "systemPrompt": "你是产品经理，负责需求分析",
+        "subagentEnabled": true
       },
       "dev": {
-        "DINGTALK_CLIENT_ID": "Dev 机器人 AppKey",
-        "DINGTALK_CLIENT_SECRET": "Dev 机器人 AppSecret",
-        "systemPrompt": "你在这里面负责服务端架构设计和开发，依据系统间的依赖关系制定开发计划"
+        "channel": "discord",
+        "discord": {
+          "TOKEN": "xxx"
+        },
+        "systemPrompt": "你是全栈工程师，擅长 SQL 编写",
+        "subagentEnabled": true
       }
     }
   }
 
-配置文件（优先级从高到低）:
-  .claudetalk.json              当前工作目录配置（优先）
-  ~/.claudetalk/claudetalk.json 全局配置（兜底）
-
-环境变量（优先级最低）:
-  DINGTALK_CLIENT_ID      钉钉应用 AppKey
-  DINGTALK_CLIENT_SECRET  钉钉应用 AppSecret
+配置文件:
+  .claudetalk.json              当前工作目录
 `)
     process.exit(0)
   }
 
-  // 处理 --setup：配置钉钉凭据
+  // --setup
   if (process.argv.includes('--setup')) {
-    await interactiveSetup(isSetupLocal, workDir, profile)
-    console.log('配置完成！运行 claudetalk 启动机器人。')
+    await interactiveSetup(workDir, profile)
+    const resolvedSetupProfile = profile ?? 'default'
+    console.log(`配置完成！运行 claudetalk --profile ${resolvedSetupProfile} 启动机器人。`)
     process.exit(0)
   }
 
-  // 1. 按 profile 加载配置（本地优先，全局兜底）
-  let clientId = ''
-  let clientSecret = ''
-  let systemPrompt = ''
-  let configSource = '环境变量'
-  let subagentEnabled = false
-  let subagentModel: string | undefined
-  let subagentPermissions: any | undefined
+  // 没有指定 profile 时，自动从配置中推断：优先 "default"，其次唯一角色
+  let resolvedProfile = profile
+  if (!resolvedProfile) {
+    const localConfig = loadRawConfig(join(workDir, LOCAL_CONFIG_FILENAME))
+    const profiles = localConfig?.profiles ?? {}
+    const profileNames = Object.keys(profiles)
 
-  const localConfigFile = join(workDir, LOCAL_CONFIG_FILENAME)
-  const localConfig = loadConfigFromFile(localConfigFile, profile)
-  const globalConfig = loadConfigFromFile(GLOBAL_CONFIG_FILE, profile)
-
-  if (localConfig) {
-    clientId = localConfig.DINGTALK_CLIENT_ID
-    clientSecret = localConfig.DINGTALK_CLIENT_SECRET
-    systemPrompt = localConfig.systemPrompt || ''
-    configSource = localConfigFile
-    // loadConfigFromFile 已将 profile 字段合并到顶层，直接读取即可
-    subagentEnabled = localConfig.subagentEnabled ?? false
-    subagentModel = localConfig.subagentModel
-    subagentPermissions = localConfig.subagentPermissions
-  } else if (globalConfig) {
-    clientId = globalConfig.DINGTALK_CLIENT_ID
-    clientSecret = globalConfig.DINGTALK_CLIENT_SECRET
-    systemPrompt = globalConfig.systemPrompt || ''
-    configSource = GLOBAL_CONFIG_FILE
-    // loadConfigFromFile 已将 profile 字段合并到顶层，直接读取即可
-    subagentEnabled = globalConfig.subagentEnabled ?? false
-    subagentModel = globalConfig.subagentModel
-    subagentPermissions = globalConfig.subagentPermissions
-  }
-
-  // 2. 指定了 profile 但找不到对应配置时，直接报错退出（不降级到环境变量）
-  if (profile && !clientId) {
-    console.error(`❌ 未找到角色 [${profile}] 的配置。`)
-    console.error('')
-    console.error(`请先运行以下命令配置此角色：`)
-    console.error(`  claudetalk --setup --local --profile ${profile}`)
-    console.error('')
-    console.error(`或查看当前配置文件: ${join(workDir, LOCAL_CONFIG_FILENAME)}`)
-    process.exit(1)
-  }
-
-  // 3. 配置文件都没有时，从环境变量读取
-  if (!clientId) clientId = process.env.DINGTALK_CLIENT_ID || ''
-  if (!clientSecret) clientSecret = process.env.DINGTALK_CLIENT_SECRET || ''
-
-  // 4. 如果都没有，引导用户设置
-  if (!clientId || !clientSecret) {
-    console.log('⚠️  未找到任何钉钉配置。')
-    console.log('')
-    if (profile) {
-      console.log(`当前角色: ${profile}`)
-      console.log(`你可以运行: claudetalk --setup --local --profile ${profile}`)
+    if (profileNames.includes('default')) {
+      resolvedProfile = 'default'
+    } else if (profileNames.length === 1) {
+      resolvedProfile = profileNames[0]
+      console.log(`ℹ️  自动使用角色: ${resolvedProfile}`)
+    } else if (profileNames.length > 1) {
+      console.error('❌ 存在多个角色，请通过 --profile <name> 指定，例如：')
+      console.error(`   claudetalk --profile ${profileNames[0]}`)
+      console.error('')
+      console.error(`可用角色: ${profileNames.join(', ')}`)
+      process.exit(1)
     } else {
-      console.log('你可以通过以下方式配置：')
-      console.log('  1. 运行交互式配置（现在）')
-      console.log('  2. 全局配置: claudetalk --setup')
-      console.log('  3. 当前目录配置: claudetalk --setup --local')
-      console.log('  4. 设置环境变量: export DINGTALK_CLIENT_ID=xxx && export DINGTALK_CLIENT_SECRET=xxx')
+      console.error('❌ 未找到任何配置，请先运行：')
+      console.error('   claudetalk --setup --profile <name>')
+      console.error('')
+      console.error('运行 claudetalk --help 查看完整用法。')
+      process.exit(1)
     }
-    console.log('')
-
-    const answer = await promptInput('是否现在进行交互式配置？(Y/n): ')
-    if (answer.toLowerCase() === 'n') {
-      process.exit(0)
-    }
-
-    const config = await interactiveSetup(false, workDir, profile)
-    clientId = config.DINGTALK_CLIENT_ID
-    clientSecret = config.DINGTALK_CLIENT_SECRET
-    systemPrompt = config.systemPrompt || ''
-    configSource = GLOBAL_CONFIG_FILE
   }
 
-  // 设置环境变量，供后续模块使用
-  process.env.DINGTALK_CLIENT_ID = clientId
-  process.env.DINGTALK_CLIENT_SECRET = clientSecret
-
-  // 显示启动信息
+  // 启动 Bot
   console.log('')
   console.log('🚀 ClaudeTalk 启动中...')
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log(`📁 工作目录: ${workDir}`)
-  if (profile) console.log(`🎭 角色: ${profile}`)
-  console.log(`🔑 AppKey: ${clientId.substring(0, 8)}...`)
-  console.log(`📄 配置来源: ${configSource}`)
-  if (profile) {
-    console.log(`💡 配置此角色: claudetalk --setup --local --profile ${profile}`)
-  } else {
-    console.log(`💡 工作目录专属机器人: claudetalk --setup --local`)
-  }
+  console.log(`🎭 角色: ${resolvedProfile}`)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('')
 
-  // 动态导入并启动 bot
-  const { startBot } = await import('./index.js')
-  await startBot({
-    clientId,
-    clientSecret,
-    workDir,
-    profile,
-    systemPrompt,
-    subagentEnabled,
-    subagentModel,
-    subagentPermissions,
-  })
+  await startBot({ workDir, profile: resolvedProfile })
 }
 
 main().catch((error) => {
