@@ -637,9 +637,29 @@ export class FeishuClient implements Channel {
       if (groupPolicy === 'at_only') {
         // 只响应 @ 机器人的消息
         const botOpenId = await this.fetchBotOpenId();
+        console.error('[feishu] ===== Mention Check Debug =====');
+        console.error('[feishu] Bot Open ID:', botOpenId);
+        console.error('[feishu] Message Mentions:', JSON.stringify(message.mentions, null, 2));
+        console.error('[feishu] Message Mentions Count:', message.mentions?.length || 0);
+        
+        // 打印每个 mention 的详细信息
+        if (message.mentions && message.mentions.length > 0) {
+          message.mentions.forEach((mention, index) => {
+            console.error(`[feishu] Mention ${index}:`);
+            console.error(`[feishu]   - Name: ${mention.name}`);
+            console.error(`[feishu]   - Open ID: ${mention.id?.open_id}`);
+            console.error(`[feishu]   - Union ID: ${mention.id?.union_id}`);
+            console.error(`[feishu]   - User ID: ${mention.id?.user_id}`);
+            console.error(`[feishu]   - Match Bot: ${mention.id?.open_id === botOpenId}`);
+          });
+        }
+        
         const isMentioned = message.mentions?.some(
           (mention) => mention.id?.open_id === botOpenId
         );
+        console.error('[feishu] Is Mentioned:', isMentioned);
+        console.error('[feishu] ================================');
+        
         if (!isMentioned) {
           console.error('[feishu] Bot not mentioned in group, ignoring message');
           return;
