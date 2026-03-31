@@ -130,9 +130,11 @@ export class FeishuClient implements Channel {
 
   constructor(config: FeishuChannelConfig) {
     this.config = config;
-    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-    this.chatMembersConfigPath = path.join(homeDir, '.claudetalk', 'chat-members.json');
-    // 说明：~/.claudetalk/chat-members.json 方案是因为飞书没有接口可以直接查询到群机器人信息
+    // 使用工作目录的 .claudetalk 目录存储 chat-members.json
+    // 统一放在 .claudetalk 目录下，便于管理项目内配置
+    const workDir = config.workDir || process.cwd();
+    this.chatMembersConfigPath = path.join(workDir, '.claudetalk', 'chat-members.json');
+    // 说明：chat-members.json 放在项目的 .claudetalk 目录下，因为飞书没有接口可以直接查询到群机器人信息
     // 只能通过历史消息的 sender 和 mentions 被动积累，并通过 API 验证后确定正确的 type
   }
 
@@ -1052,19 +1054,14 @@ ${chatMembers.map((member, index) => {
 
   /**
    * 发送消息（实现 Channel 接口）
+   * 统一使用 text 类型发送消息，支持 @标签格式
    */
   async sendMessage(
     conversationId: string,
     content: string,
     isGroup: boolean
   ): Promise<void> {
-    const messageType = this.config.messageType || 'post';
-
-    if (messageType === 'post') {
-      await this.sendPostMessage(conversationId, content, isGroup);
-    } else {
-      await this.sendTextMessage(conversationId, content, isGroup);
-    }
+    await this.sendTextMessage(conversationId, content, isGroup);
   }
 
   /**
@@ -1115,68 +1112,6 @@ ${chatMembers.map((member, index) => {
 
     if (data.code !== 0) {
       throw new Error(`Failed to send feishu text message: ${data.msg}`);
-    }
-
-    return data;
-  }
-
-  /**
-   * 发送富文本（post）消息
-   *
-   * 飞书不支持标准 Markdown，使用 post 类型富文本消息
-   * 将内容按行拆分为段落，保留换行结构
-   */
-  async sendPostMessage(
-    receiverId: string,
-    content: string,
-    isGroup: boolean
-  ): Promise<FeishuSendMessageResponse> {
-    const accessToken = await this.getAccessToken();
-    // 无论私聊还是群聊，conversationId 都是 chat_id（oc_ 开头）
-    const receiveIdType = 'chat_id';
-    void isGroup;
-
-    const postContent = {
-      zh_cn: {
-        title: 'Claude',
-        content: content.split('\n').map((line) => [{ tag: 'text', text: line }]),
-      },
-    };
-
-    const requestBody = {
-      receive_id: receiverId,
-      msg_type: 'post',
-      content: JSON.stringify(postContent),
-    };
-
-    // 打印完整的机器人回复消息，便于定位问题
-    console.error('[feishu] ===== Bot Reply Message (Post) =====');
-    console.error('[feishu] Receiver ID:', receiverId);
-    console.error('[feishu] Receive ID Type:', receiveIdType);
-    console.error('[feishu] Message Type: post');
-    console.error('[feishu] Content:', content);
-    console.error('[feishu] Post Content:', JSON.stringify(postContent, null, 2));
-    console.error('[feishu] Full Request Body:', JSON.stringify(requestBody, null, 2));
-    console.error('[feishu] =====================================');
-
-    const response = await fetch(
-      `${FEISHU_API_BASE}/im/v1/messages?receive_id_type=${receiveIdType}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json; charset=utf-8',
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify(requestBody),
-      }
-    );
-
-    const data = (await response.json()) as FeishuSendMessageResponse;
-
-    if (data.code !== 0) {
-      // 降级为文本消息
-      console.error(`[feishu] Failed to send post message (code=${data.code}), falling back to text: ${data.msg}`);
-      return this.sendTextMessage(receiverId, content, isGroup);
     }
 
     return data;

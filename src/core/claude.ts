@@ -309,8 +309,8 @@ export async function callClaude(options: CallClaudeOptions): Promise<string> {
 
     child.on('close', (code: number | null) => {
       log(`[claude] Process exited with code ${code}`)
-      if (stdout) log(`[claude] stdout (first 500 chars): ${stdout.substring(0, 500)}`)
-      if (stderr) log(`[claude] stderr: ${stderr}`)
+      if (stdout) log(`[claude] stdout (${stdout.length} chars): ${stdout}`)
+      if (stderr) log(`[claude] stderr (${stderr.length} chars): ${stderr}`)
 
       if (code !== 0) {
         const isSessionInvalid =
@@ -337,7 +337,7 @@ export async function callClaude(options: CallClaudeOptions): Promise<string> {
           return
         }
 
-        reject(new Error(`claude exited with code ${code}. stderr: ${stderr || '(empty)'}, stdout: ${stdout.substring(0, 200) || '(empty)'}`))
+        reject(new Error(`claude exited with code ${code}. stderr: ${stderr || '(empty)'}, stdout: ${stdout || '(empty)'}`))
         return
       }
 

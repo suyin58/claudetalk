@@ -204,6 +204,9 @@ async function createSubagentFile(
   systemPrompt?: string,
   model?: string
 ): Promise<void> {
+  // SubAgent 文件放在工作目录的 .claude/agents 下
+  // 符合 Claude Code 的标准 SubAgent 目录结构
+  // 每个项目可以有独立的 SubAgent 配置，与 profile 配置保持一致
   const agentsDir = join(workDir, '.claude', 'agents')
   if (!existsSync(agentsDir)) mkdirSync(agentsDir, { recursive: true })
 

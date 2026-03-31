@@ -305,6 +305,8 @@ export interface FeishuChannelConfig {
   profileName?: string
   /** 角色系统提示词（由 startBot 注入，用于上下文模板渲染） */
   systemPrompt?: string
+  /** 工作目录（由 startBot 注入，用于存储 chat-members.json） */
+  workDir?: string
 }
 
 /** 飞书 Channel 专属配置 */
