@@ -143,6 +143,9 @@ export class FeishuClient implements Channel {
   private processedPeerIds = new Set<string>();
   // 机器人的 app_name（从飞书接口获取，用于读取 peer-message 文件）
   private botAppName: string | null = null;
+  // 纯图片消息缓存：`${conversationId}:${senderId}` → 待处理的本地图片路径列表
+  // key 同时包含会话和发送者，群聊中不同用户的图片互不干扰
+  private pendingImages = new Map<string, string[]>();
 
   private readonly logger: (msg: string) => void;
 
@@ -784,40 +787,88 @@ export class FeishuClient implements Channel {
       }
     }
 
-    // 目前只处理文本消息
-    if (message.message_type !== 'text') {
-      this.logger(`Unsupported message type: ${message.message_type}, ignoring`);
-      return;
+    // 只处理文本、图片、富文本消息，其他类型回复提示并忽略
+    const supportedMessageTypes = new Set(['text', 'image', 'post'])
+    if (!supportedMessageTypes.has(message.message_type)) {
+      this.logger(`Unsupported message type: ${message.message_type}, replying with hint`)
+      await this.sendMessage(
+        conversationId,
+        `暂不支持「${message.message_type}」类型的消息，目前仅支持文字和图片。`,
+        isGroup
+      ).catch((error) => {
+        this.logger(`Failed to send unsupported type hint: ${error}`)
+      })
+      return
     }
 
-    // 解析文本内容
-    let messageText = '';
-    try {
-      const content = JSON.parse(message.content) as FeishuTextContent;
-      messageText = content.text || '';
-    } catch {
-      messageText = message.content;
-    }
+    // 解析消息内容（文字 + 图片路径列表）
+    const { messageText, imagePaths } = await this.parseFeishuMessage(
+      message.message_type,
+      message.content,
+      message.message_id
+    )
 
     // 群聊中去掉 @ 机器人的文本前缀（如 "@机器人名 你好" → "你好"）
     // 飞书消息中 @ 的格式是 @_user_N（占位符），需要用正则去掉所有 @xxx 前缀
+    let strippedMessageText = messageText
     if (isGroup) {
       // 先按 mention.name 替换
       if (message.mentions) {
         for (const mention of message.mentions) {
-          messageText = messageText.replace(`@${mention.name}`, '').trim();
+          strippedMessageText = strippedMessageText.replace(`@${mention.name}`, '').trim()
         }
       }
       // 兜底：去掉所有 @_user_N 格式的占位符
-      messageText = messageText.replace(/@_user_\d+/g, '').trim();
+      strippedMessageText = strippedMessageText.replace(/@_user_\d+/g, '').trim()
     }
 
-    if (!messageText.trim()) {
-      this.logger('[feishu] Empty message content, ignoring');
-      return;
+    // 纯图片消息（有图片但没有文字）：缓存图片路径，回复提示，不调用 Claude
+    const hasText = strippedMessageText.trim().length > 0
+    const hasImages = imagePaths.length > 0
+
+    // pendingImages 的 key 同时包含会话和发送者，群聊中不同用户的图片互不干扰
+    const pendingKey = `${conversationId}:${senderId}`
+
+    if (hasImages && !hasText) {
+      const cached = this.pendingImages.get(pendingKey) ?? []
+      this.pendingImages.set(pendingKey, [...cached, ...imagePaths])
+      this.logger(`[feishu] Pure image message cached: ${imagePaths.length} image(s) for ${pendingKey}, total pending: ${cached.length + imagePaths.length}`)
+
+      this.addMessageReaction(message.message_id, 'Get').catch((error) => {
+        this.logger(`Failed to add reaction to message ${message.message_id}: ${error}`)
+      })
+      await this.sendMessage(
+        conversationId,
+        `🖼️ 图片已收到（共 ${cached.length + imagePaths.length} 张），请继续发送指令。`,
+        isGroup
+      ).catch((error) => {
+        this.logger(`Failed to send image received hint: ${error}`)
+      })
+      return
     }
 
-    this.logger(`Received message from ${senderId} in ${conversationId}: ${messageText}`);
+    // 有文字时，合并之前缓存的图片路径（如果有）
+    const allImagePaths = [...(this.pendingImages.get(pendingKey) ?? []), ...imagePaths]
+    if (this.pendingImages.has(pendingKey)) {
+      this.logger(`[feishu] Merging ${this.pendingImages.get(pendingKey)!.length} pending image(s) into current message`)
+      this.pendingImages.delete(pendingKey)
+    }
+
+    // 拼接图片路径提示，告知 Claude 用 Read 工具读取图片
+    let finalMessageText = strippedMessageText
+    if (allImagePaths.length > 0) {
+      const imageHints = allImagePaths
+        .map((imagePath) => `[图片: ${imagePath}]`)
+        .join('\n')
+      finalMessageText = [strippedMessageText, imageHints].filter(Boolean).join('\n')
+    }
+
+    if (!finalMessageText.trim()) {
+      this.logger('[feishu] Empty message content after parsing, ignoring')
+      return
+    }
+
+    this.logger(`Received message from ${senderId} in ${conversationId}: ${finalMessageText.substring(0, 200)}`);
 
     // 立即回复 Get 表情（👌）
     this.addMessageReaction(message.message_id, 'Get').catch(error => {
@@ -853,7 +904,7 @@ export class FeishuClient implements Channel {
       if (isGroup) {
         this.logger(`Group chat detected, building context message...`);
         try {
-          contextMessage = await this.buildContextMessage(event, messageText);
+          contextMessage = await this.buildContextMessage(event, finalMessageText);
           this.logger(`Context message built successfully`);
         } catch (error) {
           this.logger(`Failed to build context message (event_id=${eventId}): ${error}`);
@@ -870,10 +921,120 @@ export class FeishuClient implements Channel {
         processedMessage: contextMessage,
       };
       try {
-        await this.channelMessageHandler(context, messageText);
+        await this.channelMessageHandler(context, finalMessageText);
       } catch (error) {
         this.logger(`Failed to execute message handler (event_id=${eventId}): ${error}`);
       }
+    }
+  }
+
+  /**
+   * 解析飞书消息内容，提取文字和图片
+   * 支持 text、image、post 三种消息类型
+   * 图片下载到 workDir/.claudetalk/feishu/images/ 目录，返回本地路径
+   */
+  private async parseFeishuMessage(
+    messageType: string,
+    rawContent: string,
+    messageId: string,
+  ): Promise<{ messageText: string; imagePaths: string[] }> {
+    const imagePaths: string[] = []
+
+    if (messageType === 'text') {
+      try {
+        const content = JSON.parse(rawContent) as FeishuTextContent
+        return { messageText: content.text || '', imagePaths }
+      } catch {
+        return { messageText: rawContent, imagePaths }
+      }
+    }
+
+    if (messageType === 'image') {
+      try {
+        const content = JSON.parse(rawContent) as { image_key: string }
+        if (content.image_key) {
+          const localPath = await this.downloadImage(content.image_key, messageId)
+          if (localPath) imagePaths.push(localPath)
+        }
+      } catch (error) {
+        this.logger(`Failed to parse image message: ${error}`)
+      }
+      return { messageText: '', imagePaths }
+    }
+
+    if (messageType === 'post') {
+      try {
+        const content = JSON.parse(rawContent) as {
+          title?: string
+          content?: Array<Array<{ tag: string; text?: string; image_key?: string }>>
+        }
+        const textParts: string[] = []
+        if (content.title) textParts.push(content.title)
+
+        for (const line of content.content || []) {
+          for (const element of line) {
+            if (element.tag === 'text' && element.text) {
+              textParts.push(element.text)
+            } else if (element.tag === 'img' && element.image_key) {
+              // 文件名用 index 区分同一消息中的多张图片，messageId 保持原始值供 API 使用
+              const localPath = await this.downloadImage(element.image_key, messageId, imagePaths.length)
+              if (localPath) imagePaths.push(localPath)
+            }
+          }
+        }
+
+        return { messageText: textParts.join(''), imagePaths }
+      } catch (error) {
+        this.logger(`Failed to parse post message: ${error}`)
+        return { messageText: rawContent, imagePaths }
+      }
+    }
+
+    return { messageText: rawContent, imagePaths }
+  }
+
+  private async downloadImage(imageKey: string, messageId: string, imageIndex?: number): Promise<string | null> {
+    try {
+      const workDir = this.config.workDir || process.cwd()
+      const imageDir = path.join(workDir, '.claudetalk', 'feishu', 'images')
+      if (!fs.existsSync(imageDir)) {
+        fs.mkdirSync(imageDir, { recursive: true })
+      }
+
+      const safeMessageId = messageId.replace(/[^a-zA-Z0-9_-]/g, '_')
+      const safeImageKey = imageKey.replace(/[^a-zA-Z0-9_-]/g, '_')
+      // post 类型消息中可能有多张图片，用 imageIndex 区分文件名
+      const indexSuffix = imageIndex !== undefined ? `_${imageIndex}` : ''
+      const fileName = `${safeMessageId}${indexSuffix}_${safeImageKey}.jpg`
+      const localPath = path.join(imageDir, fileName)
+
+      // 如果文件已存在（同一消息重复处理），直接返回路径
+      if (fs.existsSync(localPath)) {
+        this.logger(`Image already downloaded: ${localPath}`)
+        return localPath
+      }
+
+      const accessToken = await this.getAccessToken()
+      // 使用"获取消息中的资源文件"接口，需要传入 message_id 和 image_key
+      const response = await fetch(
+        `${FEISHU_API_BASE}/im/v1/messages/${messageId}/resources/${imageKey}?type=image`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      )
+
+      if (!response.ok) {
+        this.logger(`Failed to download image ${imageKey} from message ${messageId}: HTTP ${response.status}`)
+        return null
+      }
+
+      const arrayBuffer = await response.arrayBuffer()
+      fs.writeFileSync(localPath, Buffer.from(arrayBuffer))
+      this.logger(`Image downloaded: ${imageKey} → ${localPath}`)
+      return localPath
+    } catch (error) {
+      this.logger(`Error downloading image ${imageKey}: ${error}`)
+      return null
     }
   }
 
