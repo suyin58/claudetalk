@@ -11,7 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
-import type { PeerMessage } from '../types.js';
+import type { PeerMessage } from '../../types.js';
 
 // ========== 文件路径 ==========
 
@@ -19,7 +19,7 @@ import type { PeerMessage } from '../types.js';
  * 获取指定 botName 的 peer-message 文件路径
  */
 export function getPeerMessageFilePath(claudetalkDir: string, botName: string): string {
-  return path.join(claudetalkDir, `bot_${botName}.json`);
+  return path.join(claudetalkDir, 'feishu', `bot_${botName}.json`);
 }
 
 // ========== 读写操作 ==========
@@ -48,8 +48,9 @@ function atomicWritePeerMessages(claudetalkDir: string, botName: string, message
   const filePath = getPeerMessageFilePath(claudetalkDir, botName);
   const tmpFilePath = `${filePath}.tmp`;
 
-  if (!fs.existsSync(claudetalkDir)) {
-    fs.mkdirSync(claudetalkDir, { recursive: true });
+  const feishuDir = path.join(claudetalkDir, 'feishu');
+  if (!fs.existsSync(feishuDir)) {
+    fs.mkdirSync(feishuDir, { recursive: true });
   }
 
   fs.writeFileSync(tmpFilePath, JSON.stringify(messages, null, 2), 'utf-8');

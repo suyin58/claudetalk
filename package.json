@@ -9,7 +9,7 @@
     "claudetalk": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc && cp src/core/context-message.template dist/core/ && mkdir -p ~/.claudetalk && cp src/core/context-message.template ~/.claudetalk/",
+    "build": "tsc && mkdir -p dist/channels/feishu && cp src/channels/feishu/context-message.template dist/channels/feishu/ && mkdir -p ~/.claudetalk/feishu && cp src/channels/feishu/context-message.template ~/.claudetalk/feishu/",
     "dev": "bun run ./src/cli.ts",
     "type-check": "tsc --noEmit",
     "lint": "eslint src/",

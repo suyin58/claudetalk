@@ -8,6 +8,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import type {
@@ -16,14 +17,12 @@ import type {
   FeishuChannelConfig,
   PeerMessage,
 } from '../types.js';
+import { registerChannel } from './registry.js';
 import {
-  appendPeerMessage,
   loadPeerMessages,
-  parseAtMentions,
   removePeerMessages,
   writePeerMessagesFromContent,
-} from '../core/peer-message.js';
-import { registerChannel } from './registry.js';
+} from './feishu/peer-message.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -150,7 +149,7 @@ export class FeishuClient implements Channel {
     // 统一放在 .claudetalk 目录下，便于管理项目内配置
     const workDir = config.workDir || process.cwd();
     this.claudetalkDir = path.join(workDir, '.claudetalk');
-    this.chatMembersConfigPath = path.join(this.claudetalkDir, 'chat-members.json');
+    this.chatMembersConfigPath = path.join(this.claudetalkDir, 'feishu', 'chat-members.json');
     // 说明：chat-members.json 放在项目的 .claudetalk 目录下，因为飞书没有接口可以直接查询到群机器人信息
     // 只能通过历史消息的 sender 和 mentions 被动积累，并通过 API 验证后确定正确的 type
   }
@@ -1031,7 +1030,7 @@ export class FeishuClient implements Channel {
   ): Promise<string> {
     const { sender, message } = event;
     const conversationId = message.chat_id;
-    const historySize = 5; // 固定 5 条历史消息
+    const historySize = 10; // 固定 10 条历史消息
 
     console.log(`[feishu] Building context message: conversationId=${conversationId}, sender=${sender.sender_id?.open_id || '(unknown)'}, message="${messageText.substring(0, 100)}..."`);
 
@@ -1087,7 +1086,7 @@ ${chatMembers.map((member, index) => {
     console.log(`[feishu] __dirname: ${__dirname}`);
     
     // 每次都检查并更新模板文件，确保使用最新版本
-    const sourceTemplatePath = path.join(__dirname, '../core/context-message.template');
+    const sourceTemplatePath = path.join(__dirname, './context-message.template');
     console.log(`[feishu] Source template path: ${sourceTemplatePath}`);
     console.log(`[feishu] Source template exists: ${fs.existsSync(sourceTemplatePath)}`);
     
