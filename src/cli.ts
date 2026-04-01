@@ -283,43 +283,48 @@ ClaudeTalk - 通过钉钉/Discord 机器人与 Claude Code 对话
     process.exit(0)
   }
 
-  // 没有指定 profile 时，自动从配置中推断：优先 "default"，其次唯一角色
-  let resolvedProfile = profile
-  if (!resolvedProfile) {
-    const localConfig = loadRawConfig(join(workDir, LOCAL_CONFIG_FILENAME))
-    const profiles = localConfig?.profiles ?? {}
-    const profileNames = Object.keys(profiles)
-
-    if (profileNames.includes('default')) {
-      resolvedProfile = 'default'
-    } else if (profileNames.length === 1) {
-      resolvedProfile = profileNames[0]
-      console.log(`ℹ️  自动使用角色: ${resolvedProfile}`)
-    } else if (profileNames.length > 1) {
-      console.error('❌ 存在多个角色，请通过 --profile <name> 指定，例如：')
-      console.error(`   claudetalk --profile ${profileNames[0]}`)
-      console.error('')
-      console.error(`可用角色: ${profileNames.join(', ')}`)
-      process.exit(1)
-    } else {
-      console.error('❌ 未找到任何配置，请先运行：')
-      console.error('   claudetalk --setup --profile <name>')
-      console.error('')
-      console.error('运行 claudetalk --help 查看完整用法。')
-      process.exit(1)
-    }
+  // 指定了 --profile 时，只启动该角色
+  if (profile) {
+    console.log('')
+    console.log('🚀 ClaudeTalk 启动中...')
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+    console.log(`📁 工作目录: ${workDir}`)
+    console.log(`🎭 角色: ${profile}`)
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+    console.log('')
+    await startBot({ workDir, profile })
+    return
   }
 
-  // 启动 Bot
+  // 未指定 --profile 时，读取配置文件中所有 profile 并全部启动
+  const localConfig = loadRawConfig(join(workDir, LOCAL_CONFIG_FILENAME))
+  const profiles = localConfig?.profiles ?? {}
+  const profileNames = Object.keys(profiles)
+
+  if (profileNames.length === 0) {
+    console.error('❌ 未找到任何 profile 配置，请先运行：')
+    console.error('   claudetalk --setup --profile <name>')
+    console.error('')
+    console.error('运行 claudetalk --help 查看完整用法。')
+    process.exit(1)
+  }
+
   console.log('')
   console.log('🚀 ClaudeTalk 启动中...')
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log(`📁 工作目录: ${workDir}`)
-  console.log(`🎭 角色: ${resolvedProfile}`)
+  console.log(`🎭 启动所有角色: ${profileNames.join(', ')}`)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('')
 
-  await startBot({ workDir, profile: resolvedProfile })
+  // 并发启动所有 profile，每个 startBot 内部持有独立的 Channel 实例，互不干扰
+  await Promise.all(
+    profileNames.map((profileName) =>
+      startBot({ workDir, profile: profileName }).catch((error) => {
+        console.error(`❌ [${profileName}] 启动失败: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    )
+  )
 }
 
 main().catch((error) => {
