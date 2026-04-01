@@ -976,8 +976,7 @@ export class FeishuClient implements Channel {
             if (element.tag === 'text' && element.text) {
               textParts.push(element.text)
             } else if (element.tag === 'img' && element.image_key) {
-              // 文件名用 index 区分同一消息中的多张图片，messageId 保持原始值供 API 使用
-              const localPath = await this.downloadImage(element.image_key, messageId, imagePaths.length)
+              const localPath = await this.downloadImage(element.image_key, messageId)
               if (localPath) imagePaths.push(localPath)
             }
           }
@@ -993,7 +992,13 @@ export class FeishuClient implements Channel {
     return { messageText: rawContent, imagePaths }
   }
 
-  private async downloadImage(imageKey: string, messageId: string, imageIndex?: number): Promise<string | null> {
+  /**
+   * 下载飞书消息中的图片到本地，返回本地文件路径
+   * 图片保存在 workDir/.claudetalk/feishu/images/{image_key}.jpg
+   * 以 image_key 作为全局唯一标识：同一张图片无论出现在实时消息还是历史消息中，
+   * 只要 image_key 相同就复用本地缓存，无需重复下载
+   */
+  private async downloadImage(imageKey: string, messageId: string): Promise<string | null> {
     try {
       const workDir = this.config.workDir || process.cwd()
       const imageDir = path.join(workDir, '.claudetalk', 'feishu', 'images')
@@ -1001,16 +1006,14 @@ export class FeishuClient implements Channel {
         fs.mkdirSync(imageDir, { recursive: true })
       }
 
-      const safeMessageId = messageId.replace(/[^a-zA-Z0-9_-]/g, '_')
+      // 直接用 image_key 作为文件名，跨场景（实时消息/历史消息）复用缓存
       const safeImageKey = imageKey.replace(/[^a-zA-Z0-9_-]/g, '_')
-      // post 类型消息中可能有多张图片，用 imageIndex 区分文件名
-      const indexSuffix = imageIndex !== undefined ? `_${imageIndex}` : ''
-      const fileName = `${safeMessageId}${indexSuffix}_${safeImageKey}.jpg`
+      const fileName = `${safeImageKey}.jpg`
       const localPath = path.join(imageDir, fileName)
 
-      // 如果文件已存在（同一消息重复处理），直接返回路径
+      // 已下载过则直接返回本地路径，无需重复下载
       if (fs.existsSync(localPath)) {
-        this.logger(`Image already downloaded: ${localPath}`)
+        this.logger(`Image cache hit: ${imageKey} → ${localPath}`)
         return localPath
       }
 
@@ -1067,6 +1070,7 @@ export class FeishuClient implements Channel {
       data?: {
         items?: Array<{
           message_id: string;
+          msg_type: string;
           create_time: string;
           sender: {
             id: string;
@@ -1147,11 +1151,45 @@ export class FeishuClient implements Channel {
       )
     );
 
-    return items.map((item) => {
+    // 并发解析所有历史消息（含图片下载），使用 Promise.all 避免串行等待
+    return Promise.all(items.map(async (item) => {
       let messageText = '';
+      const messageType = item.msg_type || 'text';
+
       try {
-        const body = JSON.parse(item.body.content) as { text?: string };
-        messageText = body.text || item.body.content;
+        if (messageType === 'text') {
+          const body = JSON.parse(item.body.content) as { text?: string };
+          messageText = body.text || item.body.content;
+        } else if (messageType === 'image') {
+          // 纯图片消息：下载图片并拼路径
+          const body = JSON.parse(item.body.content) as { image_key?: string };
+          if (body.image_key) {
+            const localPath = await this.downloadImage(body.image_key, item.message_id).catch(() => null);
+            messageText = localPath ? `[图片: ${localPath}]` : '[图片: 下载失败]';
+          }
+        } else if (messageType === 'post') {
+          // 富文本消息：提取文字 + 下载图片
+          const body = JSON.parse(item.body.content) as {
+            title?: string;
+            content?: Array<Array<{ tag: string; text?: string; image_key?: string }>>;
+          };
+          const parts: string[] = [];
+          if (body.title) parts.push(body.title);
+          for (const line of body.content || []) {
+            for (const element of line) {
+              if (element.tag === 'text' && element.text) {
+                parts.push(element.text);
+              } else if (element.tag === 'img' && element.image_key) {
+                const localPath = await this.downloadImage(element.image_key, item.message_id).catch(() => null);
+                parts.push(localPath ? `[图片: ${localPath}]` : '[图片: 下载失败]');
+              }
+            }
+          }
+          messageText = parts.join('');
+        } else {
+          // 其他类型（audio/media/file 等）：直接标注类型，不尝试解析
+          messageText = `[${messageType} 消息]`;
+        }
       } catch {
         messageText = item.body.content;
       }
@@ -1184,7 +1222,7 @@ export class FeishuClient implements Channel {
           };
         }),
       };
-    });
+    }));
   }
 
   /**

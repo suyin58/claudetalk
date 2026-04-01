@@ -310,6 +310,13 @@ export async function callClaude(options: CallClaudeOptions): Promise<string> {
       profile && currentSubagentEnabled
         ? `Use the ${profile} agent to handle this: ${baseMessage}`
         : baseMessage
+
+    // 打印完整 prompt，便于调试
+    logger(`[claude] ===== Full Prompt =====`)
+    logger(`[claude] args: ${JSON.stringify(args)}`)
+    logger(`[claude] prompt (${actualMessage.length} chars):\n${actualMessage}`)
+    logger(`[claude] ========================`)
+
     child.stdin.write(actualMessage)
     child.stdin.end()
 
