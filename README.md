@@ -123,11 +123,17 @@ claudetalk
 # 只启动指定角色的机器人
 claudetalk --profile <角色名>
 
-# 配置当前目录默认角色
+# 配置当前目录默认角色（交互式）
 claudetalk --setup
 
-# 配置当前目录指定角色
+# 配置当前目录指定角色（交互式）
 claudetalk --setup --profile <角色名>
+
+# 批量自动配置多个角色（根据 ~/.claudetalk/agent_auto_config.json）
+claudetalk --setup auto
+
+# 编辑已有角色配置（从列表选择，支持修改 profile 名称）
+claudetalk --setup edit
 
 # 查看帮助
 claudetalk --help
