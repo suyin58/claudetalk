@@ -2,6 +2,9 @@
  * Claude Code DingTalk Channel - 钉钉 API 客户端
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
 import type {
   Channel,
   ChannelMessageContext,
@@ -12,9 +15,21 @@ import type {
   AICardCreateRequest,
   AICardStreamingRequest,
   DingTalkInboundCallback,
-} from '../types.js';
-import { registerChannel } from './registry.js';
-import { createLogger } from '../core/logger.js';
+} from '../../types.js';
+import { registerChannel } from '../registry.js';
+import { createLogger } from '../../core/logger.js';
+import { loadConfig } from '../../core/claude.js';
+import {
+  loadPeerMessages,
+  removePeerMessages,
+  writePeerMessagesFromContent,
+  type DingTalkPeerMessage,
+} from './peer-message.js';
+import {
+  appendChatHistory,
+  loadChatHistory,
+  formatChatHistory,
+} from './chat-history.js';
 
 const DINGTALK_API_BASE = 'https://api.dingtalk.com';
 const DINGTALK_STREAM_URL = process.env.DINGTALK_STREAM_URL || 'wss://dingtalk-stream.dingtalk.com/connect';
@@ -57,9 +72,20 @@ export class DingTalkClient implements Channel {
   private reconnectDelayMs: number = 3000;
   private readonly logger: (msg: string) => void;
 
+  // peer-message 相关
+  private readonly claudetalkDir: string;
+  private readonly profileName: string;
+  private peerPollTimer: ReturnType<typeof setInterval> | null = null;
+  private processedPeerIds = new Set<string>();
+  // 私聊会话 ID → 用户 open_id 映射缓存（钉钉私聊 conversationId 是会话ID，发送时需要用户 open_id）
+  private privateSenderCache = new Map<string, string>();
+
   constructor(config: DingTalkChannelConfig) {
     this.config = config;
-    this.logger = createLogger('dingtalk', (config as unknown as Record<string, string>).profileName);
+    this.profileName = config.profileName || 'default';
+    const workDir = config.workDir || process.cwd();
+    this.claudetalkDir = path.join(workDir, '.claudetalk');
+    this.logger = createLogger('dingtalk', this.profileName);
   }
 
   /**
@@ -175,6 +201,134 @@ export class DingTalkClient implements Channel {
   }
 
   /**
+   * 启动 peer-message 轮询
+   * 每 5 秒检查一次自己的 bot_{profileName}.json
+   * 处理 createdAt + 10秒 <= now 的消息
+   */
+  private startPeerMessagePolling(): void {
+    this.logger(`Starting peer message polling for profile: ${this.profileName}`);
+
+    this.peerPollTimer = setInterval(() => {
+      this.processPeerMessages().catch((error) => {
+        this.logger(`Error processing peer messages: ${error}`);
+      });
+    }, 5000);
+  }
+
+  /**
+   * 处理 peer-messages
+   * 找到 createdAt + 10秒 <= now 的消息，走 Claude CLI 流程
+   */
+  private async processPeerMessages(): Promise<void> {
+    const messages = loadPeerMessages(this.claudetalkDir, this.profileName);
+    if (messages.length === 0) return;
+
+    const now = Date.now();
+    const DELAY_MS = 10 * 1000; // 10秒延迟，等待消息稳定
+
+    const pendingMessages = messages.filter(
+      (msg: DingTalkPeerMessage) =>
+        !this.processedPeerIds.has(msg.id) && now - msg.createdAt >= DELAY_MS
+    );
+
+    if (pendingMessages.length === 0) return;
+
+    this.logger(`Processing ${pendingMessages.length} peer messages for profile: ${this.profileName}`);
+
+    for (const peerMsg of pendingMessages) {
+      this.processedPeerIds.add(peerMsg.id);
+
+      if (this.channelMessageHandler) {
+        const context: ChannelMessageContext = {
+          conversationId: peerMsg.conversationId,
+          senderId: peerMsg.from,
+          isGroup: true,
+          userId: peerMsg.from,
+        };
+
+        try {
+          await this.channelMessageHandler(context, peerMsg.message);
+          this.logger(`Peer message processed: id=${peerMsg.id}, from=${peerMsg.from}`);
+        } catch (error) {
+          this.logger(`Failed to process peer message id=${peerMsg.id}: ${error}`);
+        }
+      }
+    }
+
+    // 原子删除已处理的消息，并从内存集合中移除（避免集合无限增长）
+    removePeerMessages(this.claudetalkDir, this.profileName, this.processedPeerIds);
+    for (const peerMsg of pendingMessages) {
+      this.processedPeerIds.delete(peerMsg.id);
+    }
+  }
+
+  /**
+   * 构建群聊上下文消息（用于注入 Claude 的 prompt）
+   * 读取 context-message.template，填充历史记录、发送者信息、@列表等变量后返回完整字符串
+   *
+   * 模板查找顺序：
+   *   1. {workDir}/.claudetalk/dingtalk/context-message.template（用户自定义）
+   *   2. dist/channels/dingtalk/context-message.template（内置默认）
+   */
+  private buildContextMessage(callback: DingTalkInboundCallback, messageText: string): string {
+    const conversationId = callback.conversationId;
+
+    // 读取历史记录（最近 10 条，按时间正序）
+    const allHistory = loadChatHistory(this.claudetalkDir, conversationId);
+    // 过滤掉当前这条消息（刚写入的最后一条），避免重复
+    const historyWithoutCurrent = allHistory.slice(0, -1).slice(-10);
+    const historySection = historyWithoutCurrent.length > 0
+      ? formatChatHistory(historyWithoutCurrent)
+      : '（暂无历史消息）';
+
+    // 构建发送者信息
+    const senderInfo = `${callback.senderId}`;
+
+    // 构建 @列表段落（钉钉消息体中 atUserIds 包含被@的用户 ID 列表）
+    const atUserIds = callback.atUserIds || [];
+    const mentionsSection = atUserIds.length > 0
+      ? `- **提及了**: ${atUserIds.join(', ')}`
+      : '';
+
+    // 读取模板文件：优先用户自定义，其次内置默认
+    const userTemplatePath = path.join(this.claudetalkDir, 'template', 'context-message.template');
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+    const builtinTemplatePath = path.join(__dirname, '../../template/context-message.template');
+
+    let templateContent: string;
+    if (fs.existsSync(userTemplatePath)) {
+      templateContent = fs.readFileSync(userTemplatePath, 'utf-8');
+      this.logger(`Using user template: ${userTemplatePath}`);
+    } else if (fs.existsSync(builtinTemplatePath)) {
+      templateContent = fs.readFileSync(builtinTemplatePath, 'utf-8');
+      this.logger(`Using builtin template: ${builtinTemplatePath}`);
+    } else {
+      this.logger(`Template not found at ${userTemplatePath} or ${builtinTemplatePath}, skipping context build`);
+      return messageText;
+    }
+
+    // subagentEnabled 时 Claude Code 从 agent.md 读取角色信息，无需再注入 profileName 和 systemPrompt
+    const currentConfig = loadConfig(this.config.workDir || process.cwd(), this.profileName);
+    const subagentEnabled = currentConfig?.subagentEnabled ?? false;
+    const profileNameValue = subagentEnabled ? '' : this.profileName;
+    const systemPromptValue = subagentEnabled ? '' : (this.config.systemPrompt || '');
+    this.logger(`subagentEnabled=${subagentEnabled}, role header=${subagentEnabled ? 'skipped (agent.md)' : 'injected'}`);
+
+    // 替换模板变量
+    const result = templateContent
+      .replace(/\{\{profileName\}\}/g, profileNameValue)
+      .replace(/\{\{systemPrompt\}\}/g, systemPromptValue)
+      .replace(/\{\{senderInfo\}\}/g, senderInfo)
+      .replace(/\{\{messageText\}\}/g, messageText)
+      .replace(/\{\{mentionsSection\}\}/g, mentionsSection)
+      .replace(/\{\{historySection\}\}/g, historySection);
+
+    this.logger(`Context message built: length=${result.length}, historyCount=${historyWithoutCurrent.length}`);
+    return result;
+  }
+
+  /**
    * 启动 Stream WebSocket 连接，开始接收钉钉消息
    */
   async start(): Promise<void> {
@@ -190,7 +344,10 @@ export class DingTalkClient implements Channel {
 
     this.isManuallyClosed = false;
     this.reconnectDelayMs = 3000;
-    
+
+    // 启动 peer-message 轮询
+    this.startPeerMessagePolling();
+
     // 启动连接
     await this.connectStream();
   }
@@ -203,6 +360,10 @@ export class DingTalkClient implements Channel {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.peerPollTimer) {
+      clearInterval(this.peerPollTimer);
+      this.peerPollTimer = null;
     }
     if (this.ws) {
       this.ws.close();
@@ -395,12 +556,40 @@ export class DingTalkClient implements Channel {
 
     this.logger(`Received message from ${callback.senderId} in ${callback.conversationId}: ${messageText}`);
 
+    // 群聊消息写入历史记录
+    if (isGroup) {
+      appendChatHistory(this.claudetalkDir, callback.conversationId, {
+        timestamp: callback.createTime || Date.now(),
+        role: 'user',
+        senderId: callback.senderId,
+        content: messageText,
+      });
+    }
+
     if (this.channelMessageHandler) {
+      // 群聊时构建上下文 prompt（读取模板、历史记录、@列表等）
+      let contextMessage: string | undefined;
+      if (isGroup) {
+        this.logger('Group chat detected, building context message...');
+        try {
+          contextMessage = this.buildContextMessage(callback, messageText);
+          this.logger('Context message built successfully');
+        } catch (error) {
+          this.logger(`Failed to build context message: ${error}`);
+        }
+      }
+
+      // 私聊时缓存 conversationId → senderStaffId（发送回复时需要员工 staffId，senderId 是加密ID不能用）
+      if (!isGroup && callback.senderStaffId) {
+        this.privateSenderCache.set(callback.conversationId, callback.senderStaffId);
+      }
+
       const context: ChannelMessageContext = {
         conversationId: callback.conversationId,
         senderId: callback.senderId,
         isGroup,
         userId: callback.senderStaffId || '',
+        processedMessage: contextMessage,
       };
       await this.channelMessageHandler(context, messageText);
     }
@@ -408,6 +597,8 @@ export class DingTalkClient implements Channel {
 
   /**
    * 发送消息（实现 Channel 接口，自动判断私聊/群聊，自动选择消息类型）
+   * 发送成功后：
+   *   - 群聊：写入历史记录 + 解析 @标签写入 peer-message
    */
   async sendMessage(
     conversationId: string,
@@ -418,10 +609,30 @@ export class DingTalkClient implements Channel {
 
     if (messageType === 'card' && this.config.cardTemplateId) {
       await this.createAICard(conversationId, content);
-      return;
+    } else {
+      await this.sendMarkdownMessage(conversationId, content, isGroup);
     }
 
-    await this.sendMarkdownMessage(conversationId, content, isGroup);
+    // 群聊：写入历史记录 + 解析 @标签写入 peer-message
+    if (isGroup) {
+      appendChatHistory(this.claudetalkDir, conversationId, {
+        timestamp: Date.now(),
+        role: 'bot',
+        senderId: this.profileName,
+        content,
+      });
+
+      const knownProfiles = this.config.knownProfiles || [];
+      if (knownProfiles.length > 0) {
+        writePeerMessagesFromContent(
+          this.claudetalkDir,
+          conversationId,
+          content,
+          this.profileName,
+          knownProfiles
+        );
+      }
+    }
   }
 
   /**
@@ -521,8 +732,19 @@ export class DingTalkClient implements Channel {
           }),
         }
       );
-      return response.json();
+      const result = await response.json() as DingTalkSendResponse;
+      if (!response.ok || result.errcode) {
+        this.logger(`[sendMarkdownMessage] Group send failed: status=${response.status}, errcode=${result.errcode}, errmsg=${result.errmsg}`);
+      } else {
+        this.logger(`[sendMarkdownMessage] Group send success: conversationId=${conversationId}`);
+      }
+      return result;
     } else {
+      // 私聊时需要用用户 open_id（senderId）而非会话 ID（conversationId）
+      const userId = this.privateSenderCache.get(conversationId) || conversationId;
+      if (!this.privateSenderCache.has(conversationId)) {
+        this.logger(`[sendMarkdownMessage] No cached senderId for conversationId=${conversationId}, falling back to conversationId as userId`);
+      }
       const response = await fetch(
         `${DINGTALK_API_BASE}/v1.0/robot/oToMessages/batchSend`,
         {
@@ -533,13 +755,19 @@ export class DingTalkClient implements Channel {
           },
           body: JSON.stringify({
             robotCode,
-            userIds: [conversationId],
+            userIds: [userId],
             msgKey,
             msgParam,
           }),
         }
       );
-      return response.json();
+      const result = await response.json() as DingTalkSendResponse;
+      if (!response.ok || result.errcode) {
+        this.logger(`[sendMarkdownMessage] Private send failed: status=${response.status}, errcode=${result.errcode}, errmsg=${result.errmsg}, userId=${userId}`);
+      } else {
+        this.logger(`[sendMarkdownMessage] Private send success: conversationId=${conversationId}, userId=${userId}`);
+      }
+      return result;
     }
   }
 
@@ -748,11 +976,15 @@ registerChannel({
       secret: true,
     },
   ],
-  create(config) {
+  create(config: Record<string, string>) {
     return new DingTalkClient({
       clientId: config.DINGTALK_CLIENT_ID,
       clientSecret: config.DINGTALK_CLIENT_SECRET,
       robotCode: config.DINGTALK_CLIENT_ID,
+      profileName: config.profileName,
+      workDir: config.workDir,
+      systemPrompt: config.systemPrompt,
+      knownProfiles: config.knownProfiles ? JSON.parse(config.knownProfiles) : undefined,
     })
   },
 })

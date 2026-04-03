@@ -72,7 +72,7 @@ export async function startBot(options: StartBotOptions): Promise<void> {
 
   const channelType = config.channel ?? 'dingtalk'
   const channel = createChannel(channelType, config, workDir, profile)
-  const logger = createLogger(profile)
+  const logger = createLogger(channelType, profile)
 
   logger(`[startBot] Starting channel=${channelType}, workDir=${workDir}`)
 

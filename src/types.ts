@@ -30,6 +30,14 @@ export interface DingTalkChannelConfig {
   cardTemplateKey?: string;
   /** 调试模式 */
   debug?: boolean;
+  /** 工作目录，用于存储 peer-message 和历史记录文件 */
+  workDir?: string;
+  /** 当前机器人的 profile 名称，用于 peer-message 文件命名和 @匹配 */
+  profileName?: string;
+  /** 已知的其他机器人 profile 名称列表，用于 peer-message @匹配 */
+  knownProfiles?: string[];
+  /** 机器人角色的系统提示词，用于 context-message.template 的 {{systemPrompt}} 变量 */
+  systemPrompt?: string;
 }
 
 // 钉钉 Stream 消息

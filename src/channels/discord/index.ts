@@ -13,9 +13,9 @@ import {
   type Message,
   type TextBasedChannel,
 } from 'discord.js'
-import type { Channel, ChannelMessageContext } from '../types.js'
-import { registerChannel } from './registry.js'
-import { createLogger } from '../core/logger.js'
+import type { Channel, ChannelMessageContext } from '../../types.js'
+import { registerChannel } from '../registry.js'
+import { createLogger } from '../../core/logger.js'
 
 export interface DiscordChannelConfig {
   /** Bot Token */
@@ -261,7 +261,7 @@ registerChannel({
       required: false,
     },
   ],
-  create(config) {
+  create(config: Record<string, string>) {
     return new DiscordClient({
       token: config.TOKEN,
       guildId: config.GUILD_ID,
