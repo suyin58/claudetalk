@@ -5,6 +5,7 @@
 
 import { getChannelDescriptor } from './channels/index.js'
 import { callClaude, clearSession, createLogger, findLastActivePrivateSession, loadConfig, log } from './core/claude.js'
+import { closeLogFile, initLogFile } from './core/logger.js'
 import type { Channel, ChannelMessageContext, ClaudeTalkConfig } from './types.js'
 
 export interface StartBotOptions {
@@ -65,6 +66,9 @@ function createChannel(channelType: string, config: ClaudeTalkConfig, workDir: s
 export async function startBot(options: StartBotOptions): Promise<void> {
   const { workDir, profile } = options
 
+  // 初始化日志文件
+  initLogFile(workDir)
+
   const config = loadConfig(workDir, profile)
   if (!config) {
     throw new Error(`找不到配置，请先运行 claudetalk --setup${profile ? ` --profile ${profile}` : ''}`)
@@ -75,6 +79,23 @@ export async function startBot(options: StartBotOptions): Promise<void> {
   const logger = createLogger(channelType, profile)
 
   logger(`[startBot] Starting channel=${channelType}, workDir=${workDir}`)
+
+  // 注册进程退出时的日志文件关闭
+  process.on('SIGINT', () => {
+    logger('[startBot] Received SIGINT, shutting down...')
+    closeLogFile()
+    process.exit(0)
+  })
+
+  process.on('SIGTERM', () => {
+    logger('[startBot] Received SIGTERM, shutting down...')
+    closeLogFile()
+    process.exit(0)
+  })
+
+  process.on('exit', () => {
+    closeLogFile()
+  })
 
   // 注册统一消息处理器
   channel.onMessage(async (context: ChannelMessageContext, message: string) => {
