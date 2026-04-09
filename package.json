@@ -9,7 +9,7 @@
     "claudetalk": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc && mkdir -p dist/template && cp src/template/context-message.template dist/template/ && mkdir -p ~/.claudetalk && cp agent_auto_config.json ~/.claudetalk/",
+    "build": "tsc && mkdir -p dist/template && cp src/template/context-message.template dist/template/ && cp src/template/CLAUDE.md dist/template/ && cp src/template/agent_auto_config.json dist/template/",
     "dev": "bun run ./src/cli.ts",
     "type-check": "tsc --noEmit",
     "lint": "eslint src/",

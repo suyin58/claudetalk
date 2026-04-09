@@ -461,7 +461,16 @@ export class FeishuClient implements Channel {
    * 发送上线通知（实现 Channel 接口）
    */
   async sendOnlineNotification(userId: string, workDir: string): Promise<void> {
-    const notifyText = `✅ ClaudeTalk 已上线\n📁 工作目录: ${workDir}`;
+    const notifyText = [
+      `✅ ClaudeTalk 已上线`,
+      `📁 工作目录: ${workDir}`,
+      ``,
+      `💡 常用指令：`,
+      `  /new 或 新会话 — 清空会话记忆`,
+      `  /reset 或 清空记忆 — 同上`,
+      `  /restart 或 重启 — 重启机器人（仅私聊）`,
+      `  /help 或 帮助 — 查看全部指令`,
+    ].join('\n');
     try {
       await this.sendTextMessage(userId, notifyText, false);
     } catch (error) {

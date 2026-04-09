@@ -4,8 +4,10 @@
  */
 
 import { getChannelDescriptor } from './channels/index.js'
-import { callClaude, clearSession, createLogger, findLastActivePrivateSession, loadConfig, log } from './core/claude.js'
+import { callClaude, clearSession, createLogger, findLastActivePrivateSession, loadConfig } from './core/claude.js'
 import { closeLogFile, initLogFile } from './core/logger.js'
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'fs'
+import { join } from 'path'
 import type { Channel, ChannelMessageContext, ClaudeTalkConfig } from './types.js'
 
 export interface StartBotOptions {
@@ -16,12 +18,14 @@ export interface StartBotOptions {
 // 内置指令列表
 const RESET_COMMANDS = new Set(['新会话', '清空记忆', '/new', '/reset'])
 const HELP_COMMANDS = new Set(['/help', '帮助'])
+const RESTART_COMMANDS = new Set(['/restart', '重启'])
 
 const HELP_TEXT = [
   '🤖 **ClaudeTalk 指令帮助**',
   '',
   '- **新会话** 或 **/new** — 清空当前会话记忆，开启全新对话',
   '- **清空记忆** 或 **/reset** — 同上',
+  '- **重启** 或 **/restart** — 重启 ClaudeTalk 机器人',
   '- **帮助** 或 **/help** — 显示本帮助信息',
   '',
   '发送其他任意消息将由 Claude Code 处理。',
@@ -80,20 +84,50 @@ export async function startBot(options: StartBotOptions): Promise<void> {
 
   logger(`[startBot] Starting channel=${channelType}, workDir=${workDir}`)
 
-  // 注册进程退出时的日志文件关闭
+  // 创建 .claudetalk 目录（如果不存在）
+  const claudetalkDir = join(workDir, '.claudetalk')
+  if (!existsSync(claudetalkDir)) {
+    mkdirSync(claudetalkDir, { recursive: true })
+  }
+
+  // 保存 PID 文件
+  const pidFile = join(claudetalkDir, profile ? `claudetalk-${profile}.pid` : 'claudetalk.pid')
+  writeFileSync(pidFile, process.pid.toString(), 'utf-8')
+  logger(`[startBot] PID file created: ${pidFile}`)
+
+  // 清理 PID 文件的函数
+  const cleanupPidFile = () => {
+    try {
+      if (existsSync(pidFile)) {
+        unlinkSync(pidFile)
+        logger(`[startBot] PID file removed: ${pidFile}`)
+      }
+    } catch (error) {
+      logger(`[startBot] Failed to remove PID file: ${error}`)
+    }
+  }
+
+  // 注册进程退出时的清理
+  // 注意：SIGINT/SIGTERM 中已显式调用 cleanupPidFile，exit 事件仅作兜底（existsSync 保护防重复删除）
   process.on('SIGINT', () => {
     logger('[startBot] Received SIGINT, shutting down...')
+    channel.stop()
+    cleanupPidFile()
     closeLogFile()
     process.exit(0)
   })
 
   process.on('SIGTERM', () => {
     logger('[startBot] Received SIGTERM, shutting down...')
+    channel.stop()
+    cleanupPidFile()
     closeLogFile()
     process.exit(0)
   })
 
   process.on('exit', () => {
+    // 兜底清理：确保异常退出时也能清理 PID 文件和日志
+    cleanupPidFile()
     closeLogFile()
   })
 
@@ -116,6 +150,26 @@ export async function startBot(options: StartBotOptions): Promise<void> {
     // 内置指令：帮助（使用原始消息判断，不受 contextMessage 影响）
     if (HELP_COMMANDS.has(command)) {
       await channel.sendMessage(context.conversationId, HELP_TEXT, context.isGroup)
+      return
+    }
+
+    // 内置指令：重启（仅限单聊，防止群聊中被误触发）
+    if (RESTART_COMMANDS.has(command)) {
+      if (context.isGroup) {
+        // 群聊中忽略重启指令，不做任何响应
+        return
+      }
+      logger(`[restart] Restart command received from user ${context.userId}`)
+      await channel.sendMessage(context.conversationId, '🔄 正在重启 ClaudeTalk 机器人...', context.isGroup)
+
+      // 延迟 1 秒后重启，确保消息已发送
+      setTimeout(() => {
+        logger('[restart] Executing restart...')
+        channel.stop()
+        cleanupPidFile()
+        closeLogFile()
+        process.exit(0)
+      }, 1000)
       return
     }
 

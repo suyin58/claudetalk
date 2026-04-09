@@ -4,8 +4,9 @@
  * 通过 claudetalk 命令启动，自动管理配置文件
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
-import { join } from 'path'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } from 'fs'
+import { join, dirname } from 'path'
+import { fileURLToPath } from 'url'
 import { createInterface } from 'readline'
 import { getAllChannelDescriptors, getChannelDescriptor } from './channels/index.js'
 import { startBot } from './index.js'
@@ -120,6 +121,96 @@ function parseProfileArg(): string | undefined {
   return undefined
 }
 
+// ========== CLAUDE.md 模板写入 ==========
+
+/**
+ * 获取 CLAUDE.md 模板文件的路径
+ * 支持开发模式（src/template/）和构建后模式（dist/template/）
+ */
+function getClaudeMdTemplatePath(): string {
+  const currentFilePath = fileURLToPath(import.meta.url)
+  const currentDir = dirname(currentFilePath)
+  return join(currentDir, 'template', 'CLAUDE.md')
+}
+
+/**
+ * 检查目标 CLAUDE.md 文件是否已包含模板内容（通过第一行标题判断）
+ */
+function isClaudeMdContentAlreadyPresent(targetClaudeMdPath: string, templateContent: string): boolean {
+  if (!existsSync(targetClaudeMdPath)) return false
+  const existingContent = readFileSync(targetClaudeMdPath, 'utf-8')
+  // 取模板第一个非空行作为特征标记进行检测
+  const firstSignificantLine = templateContent.split('\n').find((line) => line.trim().length > 0) ?? ''
+  return existingContent.includes(firstSignificantLine)
+}
+
+/**
+ * 询问用户是否将 CLAUDE.md 模板内容写入项目的 CLAUDE.md 文件
+ * - 项目中不存在 CLAUDE.md 时：创建文件
+ * - 项目中已存在 CLAUDE.md 但不含模板内容时：追加到末尾
+ * - 项目中已存在 CLAUDE.md 且已含模板内容时：跳过
+ */
+async function setupClaudeMd(workDir: string): Promise<void> {
+  const templatePath = getClaudeMdTemplatePath()
+
+  if (!existsSync(templatePath)) {
+    console.log('⚠️  未找到 CLAUDE.md 模板文件，跳过此步骤。')
+    return
+  }
+
+  const templateContent = readFileSync(templatePath, 'utf-8')
+  const targetClaudeMdPath = join(workDir, 'CLAUDE.md')
+
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+  console.log('📄 第一步：配置项目 CLAUDE.md 协作规范')
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+
+  // 检查是否已包含模板内容
+  if (isClaudeMdContentAlreadyPresent(targetClaudeMdPath, templateContent)) {
+    console.log('✅ 项目 CLAUDE.md 已包含协作规范内容，跳过。')
+    console.log('')
+    return
+  }
+
+  const fileExists = existsSync(targetClaudeMdPath)
+  if (fileExists) {
+    console.log(`📝 检测到项目已有 CLAUDE.md 文件，将把协作规范追加到末尾。`)
+  } else {
+    console.log(`📝 项目中不存在 CLAUDE.md 文件，将创建并写入协作规范。`)
+  }
+
+  console.log('')
+  console.log('协作规范内容预览（前 5 行）:')
+  templateContent
+    .split('\n')
+    .slice(0, 5)
+    .forEach((line) => console.log(`   ${line}`))
+  console.log('   ...')
+  console.log('')
+
+  const confirmInput = await promptInput('是否将协作规范写入项目 CLAUDE.md？(Y/n): ')
+  const confirmed = confirmInput.toLowerCase() !== 'n'
+
+  if (!confirmed) {
+    console.log('⏭️  已跳过 CLAUDE.md 协作规范写入。')
+    console.log('')
+    return
+  }
+
+  if (fileExists) {
+    // 追加到已有文件末尾，确保与原有内容之间有空行分隔
+    const existingContent = readFileSync(targetClaudeMdPath, 'utf-8')
+    const separator = existingContent.endsWith('\n') ? '\n' : '\n\n'
+    appendFileSync(targetClaudeMdPath, separator + templateContent, 'utf-8')
+    console.log(`✅ 协作规范已追加到 ${targetClaudeMdPath}`)
+  } else {
+    writeFileSync(targetClaudeMdPath, templateContent, 'utf-8')
+    console.log(`✅ 已创建 ${targetClaudeMdPath} 并写入协作规范`)
+  }
+
+  console.log('')
+}
+
 // ========== 自动配置向导 ==========
 
 /**
@@ -127,9 +218,10 @@ function parseProfileArg(): string | undefined {
  */
 async function autoSetup(workDir: string): Promise<void> {
   const targetFile = join(workDir, LOCAL_CONFIG_FILENAME)
-  // 从用户主目录读取自动配置文件
-  const userHomeDir = process.env.HOME || process.env.USERPROFILE || ''
-  const autoConfigFile = join(userHomeDir, '.claudetalk', 'agent_auto_config.json')
+  // 从 dist/template/ 目录读取自动配置文件（与 CLAUDE.md 模板路径策略一致）
+  const currentFilePath = fileURLToPath(import.meta.url)
+  const currentDir = dirname(currentFilePath)
+  const autoConfigFile = join(currentDir, 'template', 'agent_auto_config.json')
 
   // 1. 检查 .claudetalk.json 是否已存在
   if (existsSync(targetFile)) {
@@ -142,9 +234,9 @@ async function autoSetup(workDir: string): Promise<void> {
 
   // 2. 检查 agent_auto_config.json 是否存在
   if (!existsSync(autoConfigFile)) {
-    console.error('❌ 未找到自动配置文件: .claudetalk/agent_auto_config.json')
+    console.error('❌ 未找到自动配置文件: template/agent_auto_config.json')
     console.error(`   期望路径: ${autoConfigFile}`)
-    console.error('   请确保该文件存在于用户主目录的 .claudetalk/ 目录下。')
+    console.error('   请确认 claudetalk 已正确安装（npm install -g claudetalk）。')
     process.exit(1)
   }
 
@@ -169,7 +261,10 @@ async function autoSetup(workDir: string): Promise<void> {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('')
 
-  // 5. 按顺序逐个配置 Agent
+  // 5. 询问是否将 CLAUDE.md 模板内容写入项目
+  await setupClaudeMd(workDir)
+
+  // 6. 按顺序逐个配置 Agent
   const allChannels = getAllChannelDescriptors()
   const updatedConfig: RawConfig = { profiles: {} }
 
@@ -594,6 +689,9 @@ ClaudeTalk - 通过钉钉/Discord 机器人与 Claude Code 对话
   claudetalk --setup --profile <name>                  配置当前目录指定角色（交互式）
   claudetalk --setup auto                              自动配置多个角色（根据 ~/.claudetalk/agent_auto_config.json）
   claudetalk --setup edit                              编辑已有角色配置（支持修改 profile 名称）
+  claudetalk --setup claude                            将协作规范写入项目 CLAUDE.md（创建或追加）
+  claudetalk --restart                                 重启当前目录的 ClaudeTalk 机器人
+  claudetalk --restart --profile <name>                重启指定角色的机器人
   claudetalk --help                                    显示帮助信息
 
 默认角色规则:
@@ -630,6 +728,74 @@ ClaudeTalk - 通过钉钉/Discord 机器人与 Claude Code 对话
     process.exit(0)
   }
 
+  // --restart
+  if (process.argv.includes('--restart')) {
+    console.log('')
+    console.log('🔄 正在重启 ClaudeTalk 机器人...')
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+    console.log(`📁 工作目录: ${workDir}`)
+    if (profile) {
+      console.log(`🎭 角色: ${profile}`)
+    }
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+    console.log('')
+
+    // PID 文件路径
+    const pidFile = join(workDir, '.claudetalk', profile ? `claudetalk-${profile}.pid` : 'claudetalk.pid')
+
+    // 检查 PID 文件是否存在
+    if (!existsSync(pidFile)) {
+      console.error('❌ 未找到 PID 文件，机器人可能未启动')
+      console.error(`   期望路径: ${pidFile}`)
+      console.error('')
+      console.error('💡 提示：')
+      console.error('   - 请先使用 claudetalk 命令启动机器人')
+      console.error('   - 或者在 IM 中发送 "/restart" 指令来重启机器人')
+      console.error('')
+      process.exit(1)
+    }
+
+    // 读取 PID
+    const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10)
+    if (isNaN(pid)) {
+      console.error('❌ PID 文件格式错误')
+      process.exit(1)
+    }
+
+    // 检查进程是否存在
+    try {
+      process.kill(pid, 0) // 检查进程是否存在，不发送信号
+    } catch (error) {
+      console.error('❌ 进程不存在或已停止')
+      console.error(`   PID: ${pid}`)
+      console.error('')
+      console.error('💡 提示：')
+      console.error('   - 请先使用 claudetalk 命令启动机器人')
+      console.error('   - 删除 PID 文件后重新启动')
+      console.error('')
+      process.exit(1)
+    }
+
+    // 发送 SIGTERM 信号
+    try {
+      process.kill(pid, 'SIGTERM')
+      console.log(`✅ 已发送重启信号到进程 ${pid}`)
+      console.log('')
+      console.log('💡 提示：')
+      console.log('   - 机器人将在几秒后自动重启')
+      console.log('   - 如果使用进程管理器（如 PM2、systemd），它会自动重启')
+      console.log('   - 如果是直接启动，请手动重新运行 claudetalk 命令')
+      console.log('')
+    } catch (error) {
+      console.error('❌ 发送重启信号失败')
+      console.error(`   错误: ${error instanceof Error ? error.message : String(error)}`)
+      console.error('')
+      process.exit(1)
+    }
+
+    process.exit(0)
+  }
+
   // --setup
   if (process.argv.includes('--setup')) {
     const setupArgIndex = process.argv.indexOf('--setup')
@@ -641,6 +807,9 @@ ClaudeTalk - 通过钉钉/Discord 机器人与 Claude Code 对话
     } else if (setupSubCommand === 'edit') {
       // --setup edit 模式
       await editSetup(workDir)
+    } else if (setupSubCommand === 'claude') {
+      // --setup claude 模式：单独配置项目 CLAUDE.md
+      await setupClaudeMd(workDir)
     } else {
       // --setup 交互式模式
       await interactiveSetup(workDir, profile)

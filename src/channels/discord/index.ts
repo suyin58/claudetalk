@@ -193,10 +193,20 @@ export class DiscordClient implements Channel {
    * 通过 DM 发送给指定用户
    */
   async sendOnlineNotification(userId: string, workDir: string): Promise<void> {
+    const notifyText = [
+      `✅ ClaudeTalk 已上线`,
+      `📁 工作目录: ${workDir}`,
+      ``,
+      `💡 常用指令：`,
+      `  /new 或 新会话 — 清空会话记忆`,
+      `  /reset 或 清空记忆 — 同上`,
+      `  /restart 或 重启 — 重启机器人（仅私聊）`,
+      `  /help 或 帮助 — 查看全部指令`,
+    ].join('\n')
     try {
       const user = await this.client.users.fetch(userId)
       const dmChannel = await user.createDM()
-      await dmChannel.send(`✅ ClaudeTalk 已上线\n📁 工作目录: ${workDir}`)
+      await dmChannel.send(notifyText)
     } catch (error) {
       this.logger(`[discord] 发送上线通知失败: ${error}`)
     }
