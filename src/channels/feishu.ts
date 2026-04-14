@@ -461,7 +461,7 @@ export class FeishuClient implements Channel {
       `  /help 或 帮助 — 查看全部指令`,
     ].join('\n');
     try {
-      await this.sendTextMessage(userId, notifyText, false);
+      await this.sendTextMessage(userId, notifyText);
     } catch (error) {
       this.logger(`[feishu][notify] Failed to send online notification: ${error}`);
     }
@@ -1392,29 +1392,32 @@ ${mergedMembers.map((member, index) => {
     const homeDir = process.env.HOME || process.env.USERPROFILE || '';
     const templateDir = path.join(homeDir, '.claudetalk');
     const templatePath = path.join(templateDir, 'context-message.template');
-    
+
     this.logger(`Template path: ${templatePath}`);
     this.logger(`__dirname: ${__dirname}`);
-    
-    // 每次都检查并更新模板文件，确保使用最新版本
+
     const sourceTemplatePath = path.join(__dirname, './feishu/context-message.template');
     this.logger(`Source template path: ${sourceTemplatePath}`);
     this.logger(`Source template exists: ${fs.existsSync(sourceTemplatePath)}`);
-    
+
     if (!fs.existsSync(sourceTemplatePath)) {
       this.logger(`Source template not found at ${sourceTemplatePath}`);
       throw new Error(`Template file not found at ${sourceTemplatePath}`);
     }
-    
+
     // 如果用户目录不存在，创建目录
     if (!fs.existsSync(templateDir)) {
       fs.mkdirSync(templateDir, { recursive: true });
     }
-    
-    // 每次都复制最新的模板文件，覆盖旧版本
-    fs.copyFileSync(sourceTemplatePath, templatePath);
-    this.logger(`Copied template file to ${templatePath}`);
-    
+
+    // 仅在用户目录中不存在模板文件时才复制，保留用户的自定义修改
+    if (!fs.existsSync(templatePath)) {
+      fs.copyFileSync(sourceTemplatePath, templatePath);
+      this.logger(`Template file not found, copied default to ${templatePath}`);
+    } else {
+      this.logger(`Using existing template file at ${templatePath}`);
+    }
+
     const templateContent = fs.readFileSync(templatePath, 'utf-8');
 
     // 构建 mentions 段落
@@ -1491,7 +1494,7 @@ ${mergedMembers.map((member, index) => {
     content: string,
     isGroup: boolean
   ): Promise<void> {
-    const response = await this.sendTextMessage(conversationId, content, isGroup);
+    const response = await this.sendTextMessage(conversationId, content);
 
     // 发送成功后，解析 @标签，写入 peer-messages
     const messageId = response.data?.message_id;
@@ -1506,12 +1509,11 @@ ${mergedMembers.map((member, index) => {
    * 发送文本消息
    *
    * @param receiverId - 私聊时为用户 open_id，群聊时为 chat_id
-   * @param isGroup - 是否群聊，决定 receive_id_type
+   * receive_id_type 根据 receiverId 前缀自动判断：ou_ 开头为 open_id，其余为 chat_id
    */
   async sendTextMessage(
     receiverId: string,
-    content: string,
-    isGroup: boolean
+    content: string
   ): Promise<FeishuSendMessageResponse> {
     const accessToken = await this.getAccessToken();
     // 根据 receiverId 前缀自动判断 receive_id_type：
@@ -1519,7 +1521,6 @@ ${mergedMembers.map((member, index) => {
     // - oc_ 开头：群聊 chat_id
     // - 其他（如 p2p 私聊 chat_id）：兜底用 chat_id
     const receiveIdType = receiverId.startsWith('ou_') ? 'open_id' : 'chat_id';
-    void isGroup; // isGroup 保留参数兼容性，实际不影响发送类型
 
     const requestBody = {
       receive_id: receiverId,

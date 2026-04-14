@@ -74,12 +74,12 @@ function promptInput(question: string): Promise<string> {
  */
 function promptMultiLineInput(question: string): Promise<string> {
   const readline = createInterface({ input: process.stdin, output: process.stdout })
-  
+
   return new Promise((resolve) => {
     console.log(question)
     console.log('(输入完成后，在新的一行单独输入 END 结束)')
     const lines: string[] = []
-    
+
     readline.on('line', (line: string) => {
       // 遇到单独一行的 END 标记时结束输入（不使用 trim，必须完全匹配）
       if (line === 'END' && lines.length > 0) {
@@ -571,7 +571,7 @@ async function interactiveSetup(workDir: string, profile?: string): Promise<void
   console.log('')
   console.log('📝 角色描述（可选，直接回车跳过）')
   const existingPrompt = existingProfile?.systemPrompt || ''
-  
+
   let systemPrompt: string
   if (existingPrompt) {
     // 如果有现有值，先询问是否修改

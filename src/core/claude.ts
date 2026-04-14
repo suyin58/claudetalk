@@ -30,7 +30,7 @@ export interface SessionEntry {
   channel: ChannelType
 }
 
-function parseSessionEntry(value: unknown, key: string): SessionEntry | null {
+function parseSessionEntry(value: unknown): SessionEntry | null {
   if (value && typeof value === 'object' && 'sessionId' in value) {
     const entry = value as SessionEntry
     if (!entry.userId) entry.userId = ''
@@ -51,7 +51,7 @@ function loadSessionMap(workDir: string): Map<string, SessionEntry> {
     const raw = JSON.parse(content) as Record<string, unknown>
     const entries = new Map<string, SessionEntry>()
     for (const [key, value] of Object.entries(raw)) {
-      const entry = parseSessionEntry(value, key)
+      const entry = parseSessionEntry(value)
       if (entry) {
         entries.set(key, entry)
       }
@@ -85,7 +85,8 @@ function getSessionMap(workDir: string): Map<string, SessionEntry> {
 
 /**
  * 生成 session key
- * 格式：conversationId|workDir|profile|channel
+ * 格式：conversationId\x00workDir\x00profile\x00channel
+ * 使用 \x00（NUL 字符）作为分隔符，避免路径或 ID 中含有 | 导致解析错误
  * 不同 profile、不同 channel 的 session 完全隔离
  */
 export function getSessionKey(
@@ -97,7 +98,7 @@ export function getSessionKey(
   const parts = [conversationId, workDir]
   if (profile) parts.push(profile)
   if (channel) parts.push(channel)
-  return parts.join('|')
+  return parts.join('\x00')
 }
 
 /**
@@ -133,7 +134,7 @@ export function findLastActivePrivateSession(
   const sessionMap = getSessionMap(workDir)
   let latestEntry: SessionEntry | null = null
   for (const [key, entry] of sessionMap) {
-    const parts = key.split('|')
+    const parts = key.split('\x00')
     if (parts[1] !== workDir) continue
     if (entry.isGroup) continue
     if (entry.channel !== channel) continue
@@ -305,6 +306,8 @@ export interface CallClaudeOptions {
   processedMessage?: string
 }
 
+const MAX_SESSION_RETRY_COUNT = 2
+
 /**
  * 调用 claude -p CLI 处理消息，支持多轮会话
  *
@@ -313,7 +316,7 @@ export interface CallClaudeOptions {
  * - 有 profile 但未启用 SubAgent → 通过 --append-system-prompt 传入角色信息
  * - 无 profile → 不传额外参数，Claude 自动委托
  */
-export async function callClaude(options: CallClaudeOptions): Promise<string> {
+export async function callClaude(options: CallClaudeOptions, retryCount = 0): Promise<string> {
   const {
     message,
     conversationId,
@@ -338,12 +341,15 @@ export async function callClaude(options: CallClaudeOptions): Promise<string> {
   const args = ['-p', '--output-format', 'json', '--dangerously-skip-permissions']
 
   if (existingSessionId && existingEntry) {
-    // 配置变化时清除旧 session，重建
+    // 配置变化时清除旧 session，重建（最多重试一次，防止无限递归）
     if (existingEntry.subagentEnabled !== currentSubagentEnabled) {
+      if (retryCount >= MAX_SESSION_RETRY_COUNT) {
+        throw new Error(`[session] 配置变更后重建 session 失败，已超过最大重试次数 (${MAX_SESSION_RETRY_COUNT})`)
+      }
       logger(`[session] Config changed: subagentEnabled ${existingEntry.subagentEnabled} -> ${currentSubagentEnabled}, clearing old session`)
       sessionMap.delete(sessionKey)
       saveSessionMap(workDir, sessionMap)
-      return callClaude(options)
+      return callClaude(options, retryCount + 1)
     }
 
     // 恢复 session 时也需要传入 --agents，否则 Claude Code 找不到 SubAgent 定义
@@ -407,10 +413,14 @@ export async function callClaude(options: CallClaudeOptions): Promise<string> {
           stderr.includes('Session not found') ||
           stderr.includes('--resume')
         if (isSessionInvalid) {
-          logger(`[claude] Session invalid, clearing and retrying`)
+          if (retryCount >= MAX_SESSION_RETRY_COUNT) {
+            reject(new Error(`[session] Session 无效且重试次数已达上限 (${MAX_SESSION_RETRY_COUNT})，请发送"新会话"重置后重试`))
+            return
+          }
+          logger(`[claude] Session invalid, clearing and retrying (attempt ${retryCount + 1}/${MAX_SESSION_RETRY_COUNT})`)
           sessionMap.delete(sessionKey)
           saveSessionMap(workDir, sessionMap)
-          callClaude({ ...options, channel }).then(resolve).catch(reject)
+          callClaude({ ...options, channel }, retryCount + 1).then(resolve).catch(reject)
           return
         }
 
