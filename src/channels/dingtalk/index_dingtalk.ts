@@ -782,7 +782,7 @@ export class DingTalkClient implements Channel {
     if (botLines.length === 0) {
       return '';
     }
-    return `### 👥 群成员信息（AI 机器人列表）\n\n${botLines.join('\n')}\n\n> **重要**：@ 机器人时直接使用 \`@profileName\` 文本格式（如 \`@front\`），系统会自动转换为带名称的 @ 标签展示。`;
+    return `### 👥 群成员信息（at_id映射表）`;
   }
 
   private async handleInboundMessage(callback: DingTalkInboundCallback): Promise<void> {

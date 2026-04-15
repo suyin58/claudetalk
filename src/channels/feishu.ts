@@ -1365,7 +1365,7 @@ export class FeishuClient implements Channel {
       }
 
       if (mergedMembers.length > 0) {
-        chatMembersSection = `### 👥 群成员信息（共 ${mergedMembers.length} 人，来自历史消息记录）
+        chatMembersSection = `### 👥 群成员信息（at_id映射表）
 
 ${mergedMembers.map((member, index) => {
   // @ 语法：根据 type 区分，user 用 union_id，bot 用 app_id，都没有则用 open_id
