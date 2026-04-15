@@ -291,10 +291,10 @@ export class DingTalkClient implements Channel {
   private buildContextMessage(callback: DingTalkInboundCallback, messageText: string): string {
     const conversationId = callback.conversationId;
 
-    // 读取历史记录（最近 10 条，按时间正序）
+    // 读取历史记录（最近 6 条，按时间正序）
     const allHistory = loadChatHistory(this.claudetalkDir, conversationId);
     // 过滤掉当前这条消息（刚写入的最后一条），避免重复
-    const historyWithoutCurrent = allHistory.slice(0, -1).slice(-10);
+    const historyWithoutCurrent = allHistory.slice(0, -1).slice(-6);
     const historySection = historyWithoutCurrent.length > 0
       ? formatChatHistory(historyWithoutCurrent)
       : '（暂无历史消息）';

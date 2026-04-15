@@ -1336,7 +1336,7 @@ export class FeishuClient implements Channel {
   ): Promise<string> {
     const { sender, message } = event;
     const conversationId = message.chat_id;
-    const historySize = 10; // 固定 10 条历史消息
+    const historySize = 6; // 固定 6 条历史消息
 
     this.logger(`Building context message: conversationId=${conversationId}, sender=${sender.sender_id?.open_id || '(unknown)'}, message="${messageText.substring(0, 100)}..."`);
 
