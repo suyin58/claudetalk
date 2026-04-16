@@ -22,10 +22,11 @@ https://docs.bigmodel.cn/cn/coding-plan/tool/claude
 
 ## 安装
 
+```bash
+
 # *** 全局卸载(如果不在使用的话) ***
 npm uninstall -g claudetalk
 
-```bash
 # 1. 克隆仓库
 git clone https://github.com/suyin58/claudetalk.git
 

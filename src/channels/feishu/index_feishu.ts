@@ -723,11 +723,6 @@ export class FeishuClient implements Channel {
     const { sender, message } = event;
     const isGroup = message.chat_type === 'group';
 
-    // 打印原始消息事件，便于排查问题
-    this.logger('[feishu] ===== Raw Message Event =====');
-    this.logger(`Event: ${JSON.stringify(event, null, 2)}`);
-    this.logger('[feishu] =============================');
-
     // 事件去重：使用 event_id 或 uuid 作为唯一标识
     const eventId = event.header?.event_id || event.uuid || message.message_id;
     const now = Date.now();
@@ -759,29 +754,10 @@ export class FeishuClient implements Channel {
       if (groupPolicy === 'at_only') {
         // 只响应 @ 机器人的消息
         const botOpenId = await this.fetchBotOpenId();
-        this.logger('[feishu] ===== Mention Check Debug =====');
-        this.logger(`Bot Open ID: ${botOpenId}`);
-        this.logger(`Message Mentions: ${JSON.stringify(message.mentions, null, 2)}`);
-        this.logger(`Message Mentions Count: ${message.mentions?.length || 0}`);
-        
-        // 打印每个 mention 的详细信息
-        if (message.mentions && message.mentions.length > 0) {
-          message.mentions.forEach((mention, index) => {
-            this.logger(`Mention ${index}:`);
-            this.logger(`  - Name: ${mention.name}`);
-            this.logger(`  - Open ID: ${mention.id?.open_id}`);
-            this.logger(`  - Union ID: ${mention.id?.union_id}`);
-            this.logger(`  - User ID: ${mention.id?.user_id}`);
-            this.logger(`  - Match Bot: ${mention.id?.open_id === botOpenId}`);
-          });
-        }
-        
         const isMentioned = message.mentions?.some(
           (mention) => mention.id?.open_id === botOpenId
         );
-        this.logger(`Is Mentioned: ${isMentioned}`);
-        this.logger('[feishu] ================================');
-        
+
         if (!isMentioned) {
           this.logger('[feishu] Bot not mentioned in group, ignoring message');
           return;

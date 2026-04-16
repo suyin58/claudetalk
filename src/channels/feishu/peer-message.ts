@@ -102,7 +102,9 @@ export function parseAtMentions(content: string): Array<{ userId: string; name: 
 
 /**
  * 发送消息成功后，解析 @标签，将 peer-message 写入被@机器人的文件
- * 根据 chat-members 中的 appId 匹配被@的机器人，找到对应的 botName（profile名）
+ * 匹配策略（双重兜底）：
+ *   1. 优先用 appId 匹配（精确，要求 at_id 填写正确）
+ *   2. appId 匹配失败时，fallback 到用 name 匹配（模糊，容错 at_id 填错的情况）
  *
  * @param claudetalkDir - .claudetalk 目录路径
  * @param chatId - 飞书群 chat_id
@@ -123,10 +125,20 @@ export function writePeerMessagesFromContent(
   if (mentions.length === 0) return;
 
   for (const mention of mentions) {
-    // 根据 appId 匹配被@的机器人（机器人的 user_id 就是 appId，cli_ 开头）
-    const matchedBot = chatMembers.find(
+    // 第一优先：根据 appId 精确匹配（机器人的 user_id 就是 appId，cli_ 开头）
+    let matchedBot = chatMembers.find(
       (member) => member.type === 'bot' && member.appId === mention.userId
     );
+
+    // 第二优先：appId 匹配失败时，fallback 到 name 匹配（容错 at_id 填错的情况）
+    if (!matchedBot) {
+      matchedBot = chatMembers.find(
+        (member) => member.type === 'bot' && member.name === mention.name
+      );
+      if (matchedBot) {
+        logger(`[peer-message] appId match failed, fallback to name match: name=${mention.name}, botName=${matchedBot.name}`);
+      }
+    }
 
     if (!matchedBot) {
       logger(`[peer-message] No bot matched for mention: userId=${mention.userId}, name=${mention.name}`);
