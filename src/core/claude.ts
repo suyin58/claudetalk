@@ -292,6 +292,14 @@ interface ClaudeUsage {
   cache_creation_input_tokens?: number
 }
 
+interface ClaudeModelUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens?: number
+  cacheCreationInputTokens?: number
+  costUSD?: number
+}
+
 interface ClaudeResponse {
   type: string
   subtype: string
@@ -301,6 +309,8 @@ interface ClaudeResponse {
   duration_ms: number
   stop_reason: string
   usage?: ClaudeUsage
+  // 实际 token 消耗在 modelUsage 中，按模型名称索引
+  modelUsage?: Record<string, ClaudeModelUsage>
 }
 
 export interface CallClaudeOptions {
@@ -318,7 +328,7 @@ export interface CallClaudeOptions {
 const MAX_SESSION_RETRY_COUNT = 2
 
 // 自动压缩的 input token 阈值，超过此值时在响应后异步触发 /compact
-const AUTO_COMPACT_TOKEN_THRESHOLD = 150_000
+const AUTO_COMPACT_TOKEN_THRESHOLD = 130_000
 
 // 按 sessionKey 存储正在进行的压缩 Promise，用于防止并发操作同一 session
 const compactingPromises = new Map<string, Promise<void>>()
@@ -376,7 +386,7 @@ async function compactSession(
               existingEntry.sessionId = response.session_id
               existingEntry.needsCompact = false
               saveSessionMap(workDir, sessionMap)
-              logger(`[compact] Compact done, new session_id: ${response.session_id}`)
+              logger(`[compact] Compact done, resume session_id: ${response.session_id}`)
             }
           }
         }
@@ -541,8 +551,12 @@ export async function callClaude(options: CallClaudeOptions, retryCount = 0): Pr
         }
 
         const response = JSON.parse(lastJsonLine) as ClaudeResponse
-        const inputTokens = response.usage?.input_tokens ?? 0
-        logger(`[claude] Done: duration=${response.duration_ms}ms, session_id=${response.session_id}, input_tokens=${inputTokens}`)
+
+        // 真实 token 消耗在 modelUsage 中（usage.input_tokens 通常为 0）
+        const modelUsageValues = response.modelUsage ? Object.values(response.modelUsage) : []
+        const inputTokens = modelUsageValues.reduce((sum, usage) => sum + (usage.inputTokens ?? 0), 0)
+        const cacheReadTokens = modelUsageValues.reduce((sum, usage) => sum + (usage.cacheReadInputTokens ?? 0), 0)
+        logger(`[claude] Done: duration=${response.duration_ms}ms, session_id=${response.session_id}, input_tokens=${inputTokens}, cache_read_tokens=${cacheReadTokens}`)
 
         if (response.session_id) {
           sessionMap.set(sessionKey, {
