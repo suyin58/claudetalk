@@ -28,6 +28,7 @@ export interface SessionEntry {
   userId: string
   subagentEnabled: boolean
   channel: ChannelType
+  needsCompact?: boolean
 }
 
 function parseSessionEntry(value: unknown): SessionEntry | null {
@@ -284,6 +285,13 @@ function buildAgentJson(profileName: string, config: ClaudeTalkConfig, workDir: 
 
 // ========== Claude CLI 调用 ==========
 
+interface ClaudeUsage {
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+}
+
 interface ClaudeResponse {
   type: string
   subtype: string
@@ -292,6 +300,7 @@ interface ClaudeResponse {
   session_id: string
   duration_ms: number
   stop_reason: string
+  usage?: ClaudeUsage
 }
 
 export interface CallClaudeOptions {
@@ -307,6 +316,83 @@ export interface CallClaudeOptions {
 }
 
 const MAX_SESSION_RETRY_COUNT = 2
+
+// 自动压缩的 input token 阈值，超过此值时在响应后异步触发 /compact
+const AUTO_COMPACT_TOKEN_THRESHOLD = 150_000
+
+// 按 sessionKey 存储正在进行的压缩 Promise，用于防止并发操作同一 session
+const compactingPromises = new Map<string, Promise<void>>()
+
+/**
+ * 对指定 session 执行 /compact 压缩
+ * 压缩完成后更新 sessionMap 中的 session_id（Claude CLI 压缩后会返回新的 session_id）
+ */
+async function compactSession(
+  sessionKey: string,
+  sessionId: string,
+  workDir: string,
+  profile: string | undefined,
+  baseArgs: string[]
+): Promise<void> {
+  const logger = createLogger(profile)
+  logger(`[compact] Starting auto compact for session: ${sessionId}`)
+
+  return new Promise<void>((resolve) => {
+    // 复用相同的 args（含 --resume），发送 /compact 命令
+    const compactArgs = [...baseArgs]
+    const child = spawn('claude', compactArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: workDir,
+      env: { ...process.env },
+      shell: process.platform === 'win32',
+    })
+
+    let stdout = ''
+    let stderr = ''
+
+    child.stdout.on('data', (data: Buffer) => { stdout += data.toString() })
+    child.stderr.on('data', (data: Buffer) => { stderr += data.toString() })
+
+    child.stdin.write('/compact')
+    child.stdin.end()
+
+    child.on('close', (code: number | null) => {
+      if (code !== 0) {
+        logger(`[compact] Compact failed with code ${code}, stderr: ${stderr}`)
+        resolve()
+        return
+      }
+
+      try {
+        const lines = stdout.trim().split('\n')
+        const lastJsonLine = lines.filter(line => line.startsWith('{')).pop()
+        if (lastJsonLine) {
+          const response = JSON.parse(lastJsonLine) as ClaudeResponse
+          if (response.session_id) {
+            // 更新 sessionMap 中的 session_id
+            const sessionMap = getSessionMap(workDir)
+            const existingEntry = sessionMap.get(sessionKey)
+            if (existingEntry) {
+              existingEntry.sessionId = response.session_id
+              existingEntry.needsCompact = false
+              saveSessionMap(workDir, sessionMap)
+              logger(`[compact] Compact done, new session_id: ${response.session_id}`)
+            }
+          }
+        }
+      } catch (parseError) {
+        logger(`[compact] Failed to parse compact response: ${parseError}`)
+      }
+
+      resolve()
+    })
+
+    child.on('error', (error: Error) => {
+      logger(`[compact] Spawn error: ${error.message}`)
+      resolve()
+    })
+  })
+}
 
 /**
  * 调用 claude -p CLI 处理消息，支持多轮会话
@@ -331,6 +417,14 @@ export async function callClaude(options: CallClaudeOptions, retryCount = 0): Pr
   const logger = createLogger(profile)
   const sessionMap = getSessionMap(workDir)
   const sessionKey = getSessionKey(conversationId, workDir, profile, channel)
+
+  // 如果当前 session 正在压缩，等待压缩完成后再处理新消息
+  const pendingCompact = compactingPromises.get(sessionKey)
+  if (pendingCompact) {
+    logger(`[claude] Waiting for ongoing compact to finish before processing new message`)
+    await pendingCompact
+  }
+
   const existingEntry = sessionMap.get(sessionKey)
   const existingSessionId = existingEntry?.sessionId
 
@@ -447,7 +541,8 @@ export async function callClaude(options: CallClaudeOptions, retryCount = 0): Pr
         }
 
         const response = JSON.parse(lastJsonLine) as ClaudeResponse
-        logger(`[claude] Done: duration=${response.duration_ms}ms, session_id=${response.session_id}`)
+        const inputTokens = response.usage?.input_tokens ?? 0
+        logger(`[claude] Done: duration=${response.duration_ms}ms, session_id=${response.session_id}, input_tokens=${inputTokens}`)
 
         if (response.session_id) {
           sessionMap.set(sessionKey, {
@@ -467,7 +562,24 @@ export async function callClaude(options: CallClaudeOptions, retryCount = 0): Pr
           return
         }
 
+        // 先返回结果给用户，再异步触发压缩（用户无感知）
         resolve(response.result || stdout.trim())
+
+        // 响应后检查 token 数量，超过阈值则异步触发压缩
+        if (response.session_id && inputTokens > AUTO_COMPACT_TOKEN_THRESHOLD) {
+          logger(`[compact] input_tokens (${inputTokens}) exceeded threshold (${AUTO_COMPACT_TOKEN_THRESHOLD}), triggering async compact`)
+          // 构建压缩用的 args（复用当前 args，但确保含 --resume）
+          const compactArgs = ['-p', '--output-format', 'json', '--dangerously-skip-permissions', '--resume', response.session_id]
+          if (profile && currentSubagentEnabled && currentConfig) {
+            const agentJson = buildAgentJson(profile, currentConfig, workDir)
+            if (agentJson) compactArgs.splice(1, 0, '--agents', agentJson)
+          }
+          const compactPromise = compactSession(sessionKey, response.session_id, workDir, profile, compactArgs)
+            .finally(() => {
+              compactingPromises.delete(sessionKey)
+            })
+          compactingPromises.set(sessionKey, compactPromise)
+        }
       } catch (parseError) {
         logger(`[claude] Failed to parse JSON, returning raw output: ${parseError}`)
         resolve(stdout.trim())
