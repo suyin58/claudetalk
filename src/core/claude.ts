@@ -577,7 +577,9 @@ export async function callClaude(options: CallClaudeOptions, retryCount = 0): Pr
         }
 
         // 先返回结果给用户，再异步触发压缩（用户无感知）
-        resolve(response.result || stdout.trim())
+        // 注意：response.result 可能是空字符串（agent 只做了工具调用没有文字回复）
+        // 不能 fallback 到 stdout.trim()，否则会把整个原始 JSON 返回给 IM
+        resolve(response.result || '任务执行完成，无需特殊提醒')
 
         // 响应后检查 token 数量，超过阈值则异步触发压缩
         if (response.session_id && inputTokens > AUTO_COMPACT_TOKEN_THRESHOLD) {
