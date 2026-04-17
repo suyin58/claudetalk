@@ -328,7 +328,7 @@ export interface CallClaudeOptions {
 const MAX_SESSION_RETRY_COUNT = 2
 
 // 自动压缩的 input token 阈值，超过此值时在响应后异步触发 /compact
-const AUTO_COMPACT_TOKEN_THRESHOLD = 130_000
+const AUTO_COMPACT_TOKEN_THRESHOLD = 200_000
 
 // 按 sessionKey 存储正在进行的压缩 Promise，用于防止并发操作同一 session
 const compactingPromises = new Map<string, Promise<void>>()
