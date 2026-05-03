@@ -9,7 +9,7 @@
     "claudetalk": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc && shx mkdir -p dist/template && shx cp src/template/context-message.template dist/template/ && shx cp src/template/CLAUDE.md dist/template/ && shx cp src/template/agent_auto_config.json dist/template/",
+    "build": "tsc && npx shx mkdir -p dist/template && npx shx cp src/template/context-message.template dist/template/ && npx shx cp src/template/CLAUDE.md dist/template/ && npx shx cp src/template/agent_auto_config.json dist/template/",
     "dev": "bun run ./src/cli.ts",
     "type-check": "tsc --noEmit",
     "lint": "eslint src/",
