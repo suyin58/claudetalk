@@ -655,6 +655,9 @@ export class FeishuClient implements Channel {
           this.logger(`Failed to handle message event (event_id=${eventId}): ${error}`);
         });
       },
+      // 注册空处理器，避免飞书 SDK 打印 "no handle" 警告
+      'im.message.reaction.created_v1': () => {},
+      'im.message.reaction.deleted_v1': () => {},
     });
 
     // 创建 WSClient，使用官方 SDK 建立长连接（自动处理认证、心跳、重连）
