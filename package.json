@@ -38,7 +38,6 @@
   ],
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.7.0",
-    "discord.js": "^14.25.1",
     "socks-proxy-agent": "^8.0.5"
   },
   "overrides": {

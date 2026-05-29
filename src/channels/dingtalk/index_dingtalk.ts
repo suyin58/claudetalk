@@ -782,7 +782,7 @@ export class DingTalkClient implements Channel {
     if (botLines.length === 0) {
       return '';
     }
-    return `### 👥 群成员信息（at_id映射表）`;
+    return `### 👥 群成员信息（at_id映射表）\n\n${botLines.join('\n')}\n`;
   }
 
   private async handleInboundMessage(callback: DingTalkInboundCallback): Promise<void> {

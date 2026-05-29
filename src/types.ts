@@ -279,19 +279,19 @@ export type ChannelType = string
 
 /** 跨 Channel 统一的消息上下文 */
 export interface ChannelMessageContext {
-  /** 会话 ID（钉钉 conversationId / Discord channelId） */
+  /** 会话 ID（钉钉 conversationId / 飞书 chat_id） */
   conversationId: string
   /** 发送者 ID */
   senderId: string
   /** 是否群聊 */
   isGroup: boolean
-  /** 用于私聊通知的用户标识（钉钉 staffId / Discord userId） */
+  /** 用于私聊通知的用户标识（钉钉 staffId / 飞书 open_id） */
   userId: string
   /** 加工后的消息（由 Channel 处理后生成，用于传给大模型；原始消息用于 ClaudeTalk 内置指令识别） */
   processedMessage?: string
 }
 
-/** Channel 统一接口，钉钉和 Discord 各自完整实现 */
+/** Channel 统一接口，各 Channel 各自完整实现 */
 export interface Channel {
   /** 启动连接 */
   start(): Promise<void>
@@ -303,7 +303,7 @@ export interface Channel {
   sendMessage(conversationId: string, content: string, isGroup: boolean): Promise<void>
   /** 发送上线通知（可选，各 Channel 自行实现） */
   sendOnlineNotification?(userId: string, workDir: string): Promise<void>
-  /** 获取历史消息（Discord 专有，钉钉不支持） */
+  /** 获取历史消息（可选，部分 Channel 支持） */
   getHistoryMessages?(conversationId: string, limit?: number): Promise<string[]>
 }
 
@@ -368,16 +368,6 @@ export interface FeishuProfileConfig {
   FEISHU_APP_SECRET: string
 }
 
-/** Discord Channel 专属配置 */
-export interface DiscordProfileConfig {
-  /** Bot Token */
-  TOKEN: string
-  /** Application Client ID */
-  CLIENT_ID?: string
-  /** 限定 Guild ID（可选，不填则响应所有 Guild） */
-  GUILD_ID?: string
-}
-
 /** ClaudeTalk Profile 配置 */
 export interface ProfileConfig {
   /** 消息通道类型，必填 */
@@ -386,8 +376,6 @@ export interface ProfileConfig {
   dingtalk?: DingTalkProfileConfig
   /** 飞书配置 */
   feishu?: FeishuProfileConfig
-  /** Discord 配置 */
-  discord?: DiscordProfileConfig
   /** 角色系统提示词 */
   systemPrompt?: string
   /** 是否启用 SubAgent */

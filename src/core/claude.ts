@@ -1,6 +1,6 @@
 /**
  * Claude CLI 调用层 + Session 管理
- * 两个 Channel（钉钉、Discord）共享此模块，各自独立处理消息后调用 callClaude
+ * 各 Channel（钉钉、飞书）共享此模块，各自独立处理消息后调用 callClaude
  */
 
 import { spawn } from 'child_process'
@@ -333,6 +333,10 @@ const AUTO_COMPACT_TOKEN_THRESHOLD = 200_000
 // 按 sessionKey 存储正在进行的压缩 Promise，用于防止并发操作同一 session
 const compactingPromises = new Map<string, Promise<void>>()
 
+// 按 sessionKey 串行化同一会话的入站消息，避免两条消息同时 spawn `claude --resume`
+// 导致 session 历史互相覆盖。仅外层调用 (retryCount === 0) 入队；内部 retry 复用同一槽位。
+const inFlightBySession = new Map<string, Promise<string>>()
+
 /**
  * 对指定 session 执行 /compact 压缩
  * 压缩完成后更新 sessionMap 中的 session_id（Claude CLI 压缩后会返回新的 session_id）
@@ -412,7 +416,27 @@ async function compactSession(
  * - 有 profile 但未启用 SubAgent → 通过 --append-system-prompt 传入角色信息
  * - 无 profile → 不传额外参数，Claude 自动委托
  */
-export async function callClaude(options: CallClaudeOptions, retryCount = 0): Promise<string> {
+export async function callClaude(options: CallClaudeOptions): Promise<string> {
+  // 串行化同一 session 的入站消息，避免并发 spawn `claude --resume` 互相覆盖历史
+  const channel = options.channel ?? 'dingtalk'
+  const sessionKey = getSessionKey(options.conversationId, options.workDir, options.profile, channel)
+  const previous = inFlightBySession.get(sessionKey)
+  const work = (async () => {
+    if (previous) {
+      try { await previous } catch { /* 上一条的错误不影响当前 */ }
+    }
+    return callClaudeImpl(options, 0)
+  })()
+  inFlightBySession.set(sessionKey, work)
+  work.finally(() => {
+    if (inFlightBySession.get(sessionKey) === work) {
+      inFlightBySession.delete(sessionKey)
+    }
+  }).catch(() => { /* 防止 .finally 链产生 unhandled rejection */ })
+  return work
+}
+
+async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): Promise<string> {
   const {
     message,
     conversationId,
@@ -453,7 +477,7 @@ export async function callClaude(options: CallClaudeOptions, retryCount = 0): Pr
       logger(`[session] Config changed: subagentEnabled ${existingEntry.subagentEnabled} -> ${currentSubagentEnabled}, clearing old session`)
       sessionMap.delete(sessionKey)
       saveSessionMap(workDir, sessionMap)
-      return callClaude(options, retryCount + 1)
+      return callClaudeImpl(options, retryCount + 1)
     }
 
     // 恢复 session 时也需要传入 --agents，否则 Claude Code 找不到 SubAgent 定义
@@ -524,7 +548,7 @@ export async function callClaude(options: CallClaudeOptions, retryCount = 0): Pr
           logger(`[claude] Session invalid, clearing and retrying (attempt ${retryCount + 1}/${MAX_SESSION_RETRY_COUNT})`)
           sessionMap.delete(sessionKey)
           saveSessionMap(workDir, sessionMap)
-          callClaude({ ...options, channel }, retryCount + 1).then(resolve).catch(reject)
+          callClaudeImpl({ ...options, channel }, retryCount + 1).then(resolve).catch(reject)
           return
         }
 

@@ -82,7 +82,7 @@ export function log(msg: string): void {
 /**
  * 创建带上下文前缀的局部 logger
  *
- * @param channel - 消息通道类型，如 feishu、dingtalk、discord
+ * @param channel - 消息通道类型，如 feishu、dingtalk
  * @param profile - profile 名称，如 pm、fdev
  *
  * 输出格式示例：

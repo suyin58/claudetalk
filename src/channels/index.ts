@@ -7,7 +7,6 @@
 export * from './dingtalk/index_dingtalk.js'
 export * from './feishu/index_feishu.js'
 // 新增 Channel 示例：
-// export * from './discord/index_discord.js'
 // export * from './wechat/index.js'
 
 // 导出注册表查询 API，供 index.ts 和 cli.ts 使用

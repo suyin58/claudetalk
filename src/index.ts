@@ -41,7 +41,7 @@ function createChannel(channelType: string, config: ClaudeTalkConfig, workDir: s
     throw new Error(`不支持的 channel 类型: ${channelType}，请检查配置文件中的 channel 字段`)
   }
 
-  // 取出该 Channel 的嵌套配置（如 config.dingtalk、config.discord）
+  // 取出该 Channel 的嵌套配置（如 config.dingtalk、config.feishu）
   const channelConfig = (config[channelType] ?? {}) as Record<string, string>
 
   // 校验必填字段

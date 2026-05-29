@@ -680,7 +680,7 @@ async function main(): Promise<void> {
   // --help
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
     console.log(`
-ClaudeTalk - 通过钉钉/Discord 机器人与 Claude Code 对话
+ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
 
 用法:
   claudetalk                                           启动机器人（使用默认角色）
@@ -712,9 +712,10 @@ ClaudeTalk - 通过钉钉/Discord 机器人与 Claude Code 对话
         "subagentEnabled": true
       },
       "dev": {
-        "channel": "discord",
-        "discord": {
-          "TOKEN": "xxx"
+        "channel": "feishu",
+        "feishu": {
+          "FEISHU_APP_ID": "xxx",
+          "FEISHU_APP_SECRET": "xxx"
         },
         "systemPrompt": "你是全栈工程师，擅长 SQL 编写",
         "subagentEnabled": true

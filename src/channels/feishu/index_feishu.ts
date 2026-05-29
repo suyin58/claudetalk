@@ -683,36 +683,49 @@ export class FeishuClient implements Channel {
   }
 
   /**
-   * 复制模板文件到用户目录
-   * 确保用户目录中的模板文件始终是最新版本
+   * 初始化用户目录的模板文件
+   * 仅在用户目录中不存在时复制，避免覆盖用户的自定义修改
    */
   private copyTemplateFile(): void {
     const homeDir = process.env.HOME || process.env.USERPROFILE || '';
     const templateDir = path.join(homeDir, '.claudetalk');
     const templatePath = path.join(templateDir, 'context-message.template');
-    
+
+    if (fs.existsSync(templatePath)) {
+      this.logger(`Template file already exists at ${templatePath}, keeping user customizations`);
+      return;
+    }
+
     const sourceTemplatePath = path.join(__dirname, '../../template/context-message.template');
-    
+
     if (!fs.existsSync(sourceTemplatePath)) {
       this.logger(`Source template not found at ${sourceTemplatePath}`);
       return;
     }
-    
-    // 如果用户目录不存在，创建目录
+
     if (!fs.existsSync(templateDir)) {
       fs.mkdirSync(templateDir, { recursive: true });
     }
-    
-    // 复制模板文件
+
     fs.copyFileSync(sourceTemplatePath, templatePath);
-    this.logger(`Copied template file to ${templatePath}`);
+    this.logger(`Initialized template file at ${templatePath}`);
   }
 
   /**
    * 停止 WebSocket 连接并清理资源
    */
   stop(): void {
+    if (this.peerPollTimer) {
+      clearInterval(this.peerPollTimer);
+      this.peerPollTimer = null;
+    }
     if (this.wsClient) {
+      try {
+        // force=true 走 ws.terminate()，立即断开；同时清掉 SDK 内部的 ping/重连定时器
+        this.wsClient.close({ force: true });
+      } catch (error) {
+        this.logger(`[feishu] Error closing WebSocket: ${error}`);
+      }
       this.wsClient = null;
       this.logger('[feishu] WebSocket stopped');
     }
@@ -1378,33 +1391,20 @@ ${mergedMembers.map((member, index) => {
       }
     }
 
-    // 读取模板文件（从 ~/.claudetalk/ 目录读取，首次运行时自动复制）
+    // 读取模板文件（启动时已由 copyTemplateFile 完成初始化，此处不再覆写以保留用户自定义）
     const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-    const templateDir = path.join(homeDir, '.claudetalk');
-    const templatePath = path.join(templateDir, 'context-message.template');
-    
-    this.logger(`Template path: ${templatePath}`);
-    this.logger(`__dirname: ${__dirname}`);
-    
-    // 每次都检查并更新模板文件，确保使用最新版本
-    const sourceTemplatePath = path.join(__dirname, '../../template/context-message.template');
-    this.logger(`Source template path: ${sourceTemplatePath}`);
-    this.logger(`Source template exists: ${fs.existsSync(sourceTemplatePath)}`);
-    
-    if (!fs.existsSync(sourceTemplatePath)) {
-      this.logger(`Source template not found at ${sourceTemplatePath}`);
-      throw new Error(`Template file not found at ${sourceTemplatePath}`);
+    const templatePath = path.join(homeDir, '.claudetalk', 'context-message.template');
+
+    if (!fs.existsSync(templatePath)) {
+      // 兜底：用户目录的模板被外部删除时，从内置模板回退读取
+      const sourceTemplatePath = path.join(__dirname, '../../template/context-message.template');
+      this.logger(`Template missing at ${templatePath}, falling back to ${sourceTemplatePath}`);
+      if (!fs.existsSync(sourceTemplatePath)) {
+        throw new Error(`Template file not found at ${sourceTemplatePath}`);
+      }
+      this.copyTemplateFile();
     }
-    
-    // 如果用户目录不存在，创建目录
-    if (!fs.existsSync(templateDir)) {
-      fs.mkdirSync(templateDir, { recursive: true });
-    }
-    
-    // 每次都复制最新的模板文件，覆盖旧版本
-    fs.copyFileSync(sourceTemplatePath, templatePath);
-    this.logger(`Copied template file to ${templatePath}`);
-    
+
     const templateContent = fs.readFileSync(templatePath, 'utf-8');
 
     // 构建 mentions 段落
