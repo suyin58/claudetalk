@@ -574,8 +574,28 @@ async function editSetup(workDir: string, opts: { global?: boolean } = {}): Prom
   // 4. 走完整的交互式配置流程（复用 interactiveSetup 的逻辑）
   await interactiveSetup(workDir, selectedProfileName, { global: opts.global })
 
-  // 5. 如果 profile 名称有变更，执行重命名（JSON + SubAgent .md 同步）
+  // 5. 如果 profile 名称有变更，执行重命名
+  // 顺序很关键：先 rename .md（失败 exit 让 JSON 保持原名），后 saveRawConfig
+  // 这样常见的失败模式（磁盘/权限/目标冲突）都落在 step 1，旧名整体仍可用、状态一致
   if (newProfileName !== selectedProfileName) {
+    const oldAgentMd = join(target.agentsDir, `${selectedProfileName}.md`)
+    const newAgentMd = join(target.agentsDir, `${newProfileName}.md`)
+    if (existsSync(oldAgentMd)) {
+      try {
+        renameSync(oldAgentMd, newAgentMd)
+        console.log(`✅ SubAgent 文件已重命名: ${oldAgentMd} → ${newAgentMd}`)
+      } catch (error) {
+        console.error('')
+        console.error(`❌ SubAgent 文件重命名失败: ${error instanceof Error ? error.message : String(error)}`)
+        console.error(`   旧文件: ${oldAgentMd}`)
+        console.error(`   新文件: ${newAgentMd}`)
+        console.error(`   已中止重命名，profile 仍为 [${selectedProfileName}]，请手动处理后再来。`)
+        console.error('')
+        process.exit(1)
+      }
+    }
+
+    // .md rename 成功（或本就不存在）后再改 JSON
     const updatedRaw = loadRawConfig(targetFile)
     if (updatedRaw?.profiles) {
       const oldProfileConfig = updatedRaw.profiles[selectedProfileName]
@@ -584,20 +604,6 @@ async function editSetup(workDir: string, opts: { global?: boolean } = {}): Prom
         delete updatedRaw.profiles[selectedProfileName]
         saveRawConfig(updatedRaw, targetFile)
         console.log(`✅ Profile 已从 [${selectedProfileName}] 重命名为 [${newProfileName}]`)
-      }
-    }
-    // 同步 rename SubAgent 文件（仅当旧 .md 存在时；目标已在前面校验过不存在）
-    const oldAgentMd = join(target.agentsDir, `${selectedProfileName}.md`)
-    const newAgentMd = join(target.agentsDir, `${newProfileName}.md`)
-    if (existsSync(oldAgentMd)) {
-      try {
-        renameSync(oldAgentMd, newAgentMd)
-        console.log(`✅ SubAgent 文件已重命名: ${oldAgentMd} → ${newAgentMd}`)
-      } catch (error) {
-        console.error(`⚠️  SubAgent 文件重命名失败: ${error instanceof Error ? error.message : String(error)}`)
-        console.error(`   旧文件: ${oldAgentMd}`)
-        console.error(`   新文件: ${newAgentMd}`)
-        console.error('   请手动处理。')
       }
     }
   }

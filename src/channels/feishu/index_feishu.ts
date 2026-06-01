@@ -570,7 +570,10 @@ export class FeishuClient implements Channel {
         for (const chatId in config) {
           if (chatId === '_bot_self') continue;
           const members = config[chatId];
-          const existingIndex = members.findIndex(m => m.name === app_name);
+          // 必须加 type === 'bot' 守护：飞书允许用户昵称与 app_name 撞名，
+          // 不加守护会把同名 user 强改成 bot 并赋上 profileName，
+          // 后续 supervision 会把该"假 bot"塞进 botProfiles 让 LLM 选去 @
+          const existingIndex = members.findIndex(m => m.type === 'bot' && m.name === app_name);
 
           if (existingIndex >= 0) {
             // 更新现有机器人信息
@@ -605,7 +608,12 @@ export class FeishuClient implements Channel {
         // 幂等 upsert _bot_self：按 appId 去重，每次启动都 ensure 自己在
         // 修复点：原实现只在 config 完全为空时才创建 _bot_self，导致同 workDir 第二个 profile 启动时无法注册
         const botSelf: ChatMember[] = config['_bot_self'] || [];
-        const selfIdx = botSelf.findIndex(m => m.appId === appId);
+        // 先按 appId 主键找；老格式（无 appId 字段）按 type+name 兜底——命中后下面的 upsert
+        // 会把 desired（含 appId、profileName）整体合并进去，自动补齐缺失字段
+        let selfIdx = botSelf.findIndex(m => m.appId === appId);
+        if (selfIdx < 0) {
+          selfIdx = botSelf.findIndex(m => m.type === 'bot' && m.name === app_name);
+        }
         const desired: ChatMember = {
           name: app_name,
           type: 'bot',

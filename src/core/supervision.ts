@@ -405,16 +405,48 @@ async function getFeishuToken(appId: string, appSecret: string): Promise<string 
   }
 }
 
+/**
+ * 从文本里扫出所有 top-level {...} 段，正确处理字符串内的 {/} 和转义
+ * 用于替代非贪婪正则——后者在 message 里出现 {bug-123} 等字面量时会截断
+ */
+function extractTopLevelObjects(text: string): string[] {
+  const out: string[] = []
+  let depth = 0
+  let start = -1
+  let inString = false
+  let escape = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (escape) { escape = false; continue }
+    if (c === '\\') { escape = true; continue }
+    if (c === '"') { inString = !inString; continue }
+    if (inString) continue
+    if (c === '{') {
+      if (depth === 0) start = i
+      depth++
+    } else if (c === '}') {
+      if (depth > 0) {
+        depth--
+        if (depth === 0 && start !== -1) {
+          out.push(text.slice(start, i + 1))
+          start = -1
+        }
+      }
+    }
+  }
+  return out
+}
+
 function parseDecision(text: string): FollowUpDecision {
-  // 从后向前找第一个能 JSON.parse 通过的 {...} 段。
+  // 从后向前找第一个能 JSON.parse 通过的 top-level {...}。
   // 选最后一段而非最长，避免误选 prompt 中的示例 JSON（LLM 偶尔会先 echo 示例再吐真实结果）。
-  const matches = text.match(/\{[\s\S]*?\}/g)
-  if (!matches || matches.length === 0) {
+  const candidates = extractTopLevelObjects(text)
+  if (candidates.length === 0) {
     return { shouldFollowUp: false, reason: 'LLM 返回中找不到 JSON' }
   }
-  for (let i = matches.length - 1; i >= 0; i--) {
+  for (let i = candidates.length - 1; i >= 0; i--) {
     try {
-      return JSON.parse(matches[i]) as FollowUpDecision
+      return JSON.parse(candidates[i]) as FollowUpDecision
     } catch {
       // 该段无法解析，继续往前找
     }
