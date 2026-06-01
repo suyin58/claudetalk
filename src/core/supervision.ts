@@ -265,9 +265,9 @@ async function fetchFeishuRecent(
   const token = await getFeishuToken(appId, appSecret)
   if (!token) return []
 
-  // 2. 拉历史（按创建时间倒序）
+  // 2. 拉历史（按创建时间倒序）；chatId 走 encodeURIComponent 防特殊字符破坏 query
   const historyResp = await fetch(
-    `https://open.feishu.cn/open-apis/im/v1/messages?container_id_type=chat&container_id=${chatId}&page_size=${limit}&sort_type=ByCreateTimeDesc`,
+    `https://open.feishu.cn/open-apis/im/v1/messages?container_id_type=chat&container_id=${encodeURIComponent(chatId)}&page_size=${limit}&sort_type=ByCreateTimeDesc`,
     { headers: { Authorization: `Bearer ${token}` } }
   )
   const historyData = await historyResp.json() as {

@@ -62,9 +62,28 @@ function writeLockAtomic(lockPath: string, info: LockInfo): void {
 }
 
 /**
+ * O_EXCL 互斥创建：成功 = 文件原本不存在；EEXIST = 已有别人持锁
+ * 用于消除 existsSync→write 之间的 TOCTOU 窗口
+ */
+function tryExclusiveCreate(lockPath: string, info: LockInfo): boolean {
+  const dir = getGlobalLocksDir()
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true })
+  }
+  try {
+    writeFileSync(lockPath, JSON.stringify(info, null, 2) + '\n', { encoding: 'utf-8', flag: 'wx' })
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'EEXIST') return false
+    throw error
+  }
+}
+
+/**
  * 尝试为指定 bot 凭据获取实例锁
- * - 锁不存在 → 写新锁，返回 ok
- * - 锁存在但进程已死 → 覆盖 stale lock，返回 ok
+ * - 锁文件不存在 → O_EXCL 互斥创建，返回 ok
+ * - 锁存在但进程已死 → 视为 stale，强制覆盖（tmp+rename），返回 ok
  * - 锁存在且进程在跑 → 返回 ok: false 含已有锁信息（由 caller 决定如何提示）
  */
 export function acquireBotLock(params: {
@@ -76,15 +95,6 @@ export function acquireBotLock(params: {
 }): AcquireResult {
   const lockKey = getLockKey(params.channel, params.credential)
   const lockPath = getLockFilePath(lockKey)
-
-  if (existsSync(lockPath)) {
-    const existing = readLockFile(lockPath)
-    if (existing && existing.pid !== params.pid && isProcessAlive(existing.pid)) {
-      return { ok: false, existing, lockKey }
-    }
-    // existing 为 null（损坏）或进程已死 → 视为 stale，覆盖
-  }
-
   const info: LockInfo = {
     pid: params.pid,
     workDir: params.workDir,
@@ -92,6 +102,19 @@ export function acquireBotLock(params: {
     channel: params.channel,
     startedAt: new Date().toISOString(),
   }
+
+  // 首选：O_EXCL 互斥创建，规避 existsSync→write 间的 TOCTOU race
+  if (tryExclusiveCreate(lockPath, info)) {
+    return { ok: true, lockKey }
+  }
+
+  // 文件已存在：判断持有者是否还活着
+  const existing = readLockFile(lockPath)
+  if (existing && existing.pid !== params.pid && isProcessAlive(existing.pid)) {
+    return { ok: false, existing, lockKey }
+  }
+
+  // stale lock（文件损坏或进程已死）→ 强制覆盖（仍用 tmp+rename 保证写入原子）
   writeLockAtomic(lockPath, info)
   return { ok: true, lockKey }
 }

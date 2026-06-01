@@ -958,11 +958,11 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
   // --setup
   if (process.argv.includes('--setup')) {
     const setupArgIndex = process.argv.indexOf('--setup')
-    // 跳过 --global 标志，取真正的子命令（auto / edit / claude / 无）
-    let setupSubCommand = process.argv[setupArgIndex + 1]
-    if (setupSubCommand === '--global') {
-      setupSubCommand = process.argv[setupArgIndex + 2]
-    }
+    // 取 --setup 之后第一个非 `--*` 参数作为子命令（auto / edit / claude / 无）
+    // 这样 `--setup auto --global`、`--setup --global auto`、`--setup --global --profile foo` 都能正确归类
+    const setupSubCommand = process.argv
+      .slice(setupArgIndex + 1)
+      .find(arg => !arg.startsWith('--'))
     const isGlobal = hasGlobalFlag()
 
     if (setupSubCommand === 'auto') {
