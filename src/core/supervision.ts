@@ -24,7 +24,12 @@ const DEFAULTS = {
   cooldownMs: 20 * 60 * 1000,       // 介入后 20 分钟冷却
 }
 
-const RECENT_LIMIT = 10  // 给 LLM 的最近消息条数
+const RECENT_LIMIT = 10        // 给 LLM 的最近消息条数
+const LLM_TIMEOUT_MS = 60_000  // 单次 LLM 调用超时；超时即 drop 本群，避免 busy 锁永远不释放
+const TOKEN_REFRESH_BUFFER_MS = 60_000  // token 过期前 60s 视为失效，提前刷新
+
+// 飞书 tenant_access_token 缓存（按 appId 维度；同进程内多 supervisor 共享）
+const feishuTokenCache = new Map<string, { token: string; expiresAt: number }>()
 
 interface RecentMessage {
   timestamp: number
@@ -63,6 +68,7 @@ export function startSupervision(params: StartSupervisionParams): SupervisionRun
   const logger = createLogger('supervisor', params.profile)
   const lastInterventionAt = new Map<string, number>()
   let stopped = false
+  let ticking = false  // busy 锁：上一轮未完成就跳过本轮，避免并发叠加
 
   logger(
     `监督循环已启动 (检查间隔 ${settings.checkIntervalMs / 60000} 分钟, ` +
@@ -72,10 +78,17 @@ export function startSupervision(params: StartSupervisionParams): SupervisionRun
 
   const tick = async () => {
     if (stopped) return
+    if (ticking) {
+      logger('上一轮检查仍在进行，跳过本轮')
+      return
+    }
+    ticking = true
     try {
       await runOneCheck(params, settings, lastInterventionAt, logger)
     } catch (error) {
       logger(`[ERROR] 监督检查失败: ${error}`)
+    } finally {
+      ticking = false
     }
   }
 
@@ -88,6 +101,19 @@ export function startSupervision(params: StartSupervisionParams): SupervisionRun
       logger('监督循环已停止')
     }
   }
+}
+
+/**
+ * 给 Promise 加超时；超时抛错由 caller catch
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v) },
+      (e) => { clearTimeout(timer); reject(e) }
+    )
+  })
 }
 
 async function runOneCheck(
@@ -153,12 +179,33 @@ async function checkOneChat(
     }
 
     logger(`[${chatId}] 停滞 ${Math.round(idle / 60000)} 分钟，调用 LLM 判断是否跟进...`)
-    let decision = await askLLMForDecision(params, chatId, recent, botProfiles, idle)
-    if (!validateDecision(decision, botProfiles)) {
-      logger(`[${chatId}] LLM 输出校验失败 (${decision.reason ?? 'unknown'})，重试一次...`)
-      decision = await askLLMForDecision(params, chatId, recent, botProfiles, idle)
-      if (!validateDecision(decision, botProfiles)) {
-        logger(`[${chatId}] LLM 输出校验仍失败 (${decision.reason ?? 'unknown'})，drop`)
+    let decision: FollowUpDecision
+    try {
+      decision = await withTimeout(
+        askLLMForDecision(params, chatId, recent, botProfiles, idle),
+        LLM_TIMEOUT_MS,
+        `[${chatId}] LLM 调用`
+      )
+    } catch (error) {
+      logger(`[${chatId}] LLM 调用超时或失败，drop: ${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    let validation = validateDecision(decision, botProfiles)
+    if (!validation.ok) {
+      logger(`[${chatId}] LLM 输出校验失败 (${validation.reason ?? 'unknown'})，重试一次...`)
+      try {
+        decision = await withTimeout(
+          askLLMForDecision(params, chatId, recent, botProfiles, idle),
+          LLM_TIMEOUT_MS,
+          `[${chatId}] LLM 重试`
+        )
+      } catch (error) {
+        logger(`[${chatId}] LLM 重试超时或失败，drop: ${error instanceof Error ? error.message : String(error)}`)
+        return
+      }
+      validation = validateDecision(decision, botProfiles)
+      if (!validation.ok) {
+        logger(`[${chatId}] LLM 输出校验仍失败 (${validation.reason ?? 'unknown'})，drop`)
         return
       }
     }
@@ -215,15 +262,8 @@ async function fetchFeishuRecent(
   const appSecret = params.channelConfig['FEISHU_APP_SECRET'] as string | undefined
   if (!appId || !appSecret) return []
 
-  // 1. 拿 tenant access token（短期 ttl，每轮拉一次足够；监督频率 20 分钟，不缓存也 OK）
-  const tokenResp = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
-  })
-  const tokenData = await tokenResp.json() as { code: number; tenant_access_token?: string }
-  if (tokenData.code !== 0 || !tokenData.tenant_access_token) return []
-  const token = tokenData.tenant_access_token
+  const token = await getFeishuToken(appId, appSecret)
+  if (!token) return []
 
   // 2. 拉历史（按创建时间倒序）
   const historyResp = await fetch(
@@ -330,45 +370,79 @@ ${recentLines}
   return parseDecision(response)
 }
 
+/**
+ * 取飞书 tenant_access_token，命中且未过期则复用
+ * token TTL ~ 2h；每个监督 tick 都重申会浪费配额并可能被风控
+ */
+async function getFeishuToken(appId: string, appSecret: string): Promise<string | null> {
+  const now = Date.now()
+  const cached = feishuTokenCache.get(appId)
+  if (cached && cached.expiresAt - now > TOKEN_REFRESH_BUFFER_MS) {
+    return cached.token
+  }
+  try {
+    const tokenResp = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+    })
+    const tokenData = await tokenResp.json() as {
+      code: number
+      tenant_access_token?: string
+      expire?: number  // 秒
+    }
+    if (tokenData.code !== 0 || !tokenData.tenant_access_token) {
+      return null
+    }
+    const ttlMs = (tokenData.expire ?? 7200) * 1000
+    feishuTokenCache.set(appId, {
+      token: tokenData.tenant_access_token,
+      expiresAt: now + ttlMs,
+    })
+    return tokenData.tenant_access_token
+  } catch {
+    return null
+  }
+}
+
 function parseDecision(text: string): FollowUpDecision {
-  // 宽松匹配：取最末一个 {...} 段
+  // 从后向前找第一个能 JSON.parse 通过的 {...} 段。
+  // 选最后一段而非最长，避免误选 prompt 中的示例 JSON（LLM 偶尔会先 echo 示例再吐真实结果）。
   const matches = text.match(/\{[\s\S]*?\}/g)
   if (!matches || matches.length === 0) {
     return { shouldFollowUp: false, reason: 'LLM 返回中找不到 JSON' }
   }
-  // 偏好最长的（最完整）；若简单匹配错误，取最后一个
-  let best = matches[matches.length - 1]
-  for (const m of matches) {
-    if (m.length > best.length) best = m
+  for (let i = matches.length - 1; i >= 0; i--) {
+    try {
+      return JSON.parse(matches[i]) as FollowUpDecision
+    } catch {
+      // 该段无法解析，继续往前找
+    }
   }
-  try {
-    return JSON.parse(best) as FollowUpDecision
-  } catch {
-    return { shouldFollowUp: false, reason: 'LLM JSON 解析失败' }
-  }
+  return { shouldFollowUp: false, reason: 'LLM 返回中所有 JSON 段都解析失败' }
 }
 
-function validateDecision(decision: FollowUpDecision, botProfiles: string[]): boolean {
-  if (decision.shouldFollowUp === false) return true
+interface ValidationResult {
+  ok: boolean
+  reason?: string
+}
+
+function validateDecision(decision: FollowUpDecision, botProfiles: string[]): ValidationResult {
+  if (decision.shouldFollowUp === false) return { ok: true }
   if (decision.shouldFollowUp !== true) {
-    decision.reason = 'shouldFollowUp 字段缺失或非布尔'
-    return false
+    return { ok: false, reason: 'shouldFollowUp 字段缺失或非布尔' }
   }
   if (!decision.mention || typeof decision.mention !== 'string') {
-    decision.reason = 'mention 缺失'
-    return false
+    return { ok: false, reason: 'mention 缺失' }
   }
   if (!botProfiles.includes(decision.mention)) {
-    decision.reason = `mention "${decision.mention}" 不在 agent 列表 [${botProfiles.join(', ')}] 中`
-    return false
+    return { ok: false, reason: `mention "${decision.mention}" 不在 agent 列表 [${botProfiles.join(', ')}] 中` }
   }
   if (!decision.message || typeof decision.message !== 'string') {
-    decision.reason = 'message 缺失'
-    return false
+    return { ok: false, reason: 'message 缺失' }
   }
   if (!decision.message.includes(`@${decision.mention}`)) {
-    decision.reason = `message 中缺少字面 @${decision.mention}`
-    return false
+    return { ok: false, reason: `message 中缺少字面 @${decision.mention}` }
   }
-  return true
+  return { ok: true }
 }
