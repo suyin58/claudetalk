@@ -4,16 +4,48 @@
  * 通过 claudetalk 命令启动，自动管理配置文件
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { createInterface } from 'readline'
 import { getAllChannelDescriptors, getChannelDescriptor } from './channels/index.js'
 import { startBot } from './index.js'
 import type { ProfileConfig } from './types.js'
+import {
+  getGlobalAgentsDir,
+  getGlobalConfigPath,
+  getGlobalDir,
+  getLocalConfigPath,
+  resolveConfigPath,
+  type ConfigSource,
+} from './core/global-config.js'
 
-// ========== 配置文件路径 ==========
-const LOCAL_CONFIG_FILENAME = '.claudetalk.json'
+// 解析 --global 标志（用于 setup 系列命令）
+function hasGlobalFlag(): boolean {
+  return process.argv.includes('--global')
+}
+
+// 根据 --global 决定本次 setup 写入的目标路径与 agents 目录
+interface SetupTarget {
+  configPath: string
+  agentsDir: string
+  scope: ConfigSource
+}
+
+function getSetupTarget(workDir: string, isGlobal: boolean): SetupTarget {
+  if (isGlobal) {
+    return {
+      configPath: getGlobalConfigPath(),
+      agentsDir: getGlobalAgentsDir(),
+      scope: 'global',
+    }
+  }
+  return {
+    configPath: getLocalConfigPath(workDir),
+    agentsDir: join(workDir, '.claude', 'agents'),
+    scope: 'local',
+  }
+}
 
 // ========== 配置类型 ==========
 
@@ -110,6 +142,51 @@ function loadRawConfig(filePath: string): RawConfig | null {
 
 function saveRawConfig(config: RawConfig, filePath: string): void {
   writeFileSync(filePath, JSON.stringify(config, null, 2) + '\n', 'utf-8')
+}
+
+/**
+ * 交互式询问"是否将此 profile 设为项目监督者"
+ * 同 workDir 已有监督者时提示"会替换"
+ * 返回 { enabled, conflictsToClear }：conflictsToClear 是需要被剥除 supervisorRole 的其他 profile 名
+ */
+async function promptSupervisorRole(
+  existingRaw: RawConfig | null,
+  currentProfile: string
+): Promise<{ enabled: boolean; conflictsToClear: string[] }> {
+  const others = Object.entries(existingRaw?.profiles ?? {})
+    .filter(([name, p]) => name !== currentProfile && (p as ProfileConfig).supervisorRole === true)
+    .map(([name]) => name)
+
+  console.log('')
+  console.log('🎯 项目监督者（可选）')
+  console.log('   项目监督者会定时检查群聊是否停滞，自动 @ 下一个 agent 把流程续上。每个项目最多 1 个。')
+
+  const prompt = others.length > 0
+    ? `是否将 [${currentProfile}] 设为项目监督者？已设监督者：${others.join(', ')}（选 y 会替换它们）(y/N): `
+    : `是否将 [${currentProfile}] 设为项目监督者？(y/N): `
+
+  const input = await promptInput(prompt)
+  const enabled = input.toLowerCase() === 'y'
+  return { enabled, conflictsToClear: enabled ? others : [] }
+}
+
+/**
+ * 从 profiles 中剥除若干 profile 的 supervisorRole 字段（保留其他配置）
+ */
+function clearSupervisorRoleOn(
+  profiles: Record<string, ProfileConfig>,
+  names: string[]
+): Record<string, ProfileConfig> {
+  const cleaned = { ...profiles }
+  for (const name of names) {
+    const old = cleaned[name]
+    if (old) {
+      const copy = { ...old }
+      delete copy.supervisorRole
+      cleaned[name] = copy
+    }
+  }
+  return cleaned
 }
 
 function parseProfileArg(): string | undefined {
@@ -216,19 +293,25 @@ async function setupClaudeMd(workDir: string): Promise<void> {
 /**
  * 自动配置向导 - 根据 agent_auto_config.json 批量配置多个 Agent
  */
-async function autoSetup(workDir: string): Promise<void> {
-  const targetFile = join(workDir, LOCAL_CONFIG_FILENAME)
+async function autoSetup(workDir: string, opts: { global?: boolean } = {}): Promise<void> {
+  const target = getSetupTarget(workDir, !!opts.global)
+  const targetFile = target.configPath
+  const scopeLabel = target.scope === 'global' ? '全局' : '本地'
   // 从 dist/template/ 目录读取自动配置文件（与 CLAUDE.md 模板路径策略一致）
   const currentFilePath = fileURLToPath(import.meta.url)
   const currentDir = dirname(currentFilePath)
   const autoConfigFile = join(currentDir, 'template', 'agent_auto_config.json')
 
-  // 1. 检查 .claudetalk.json 是否已存在
+  // 全局配置写入前先确保目录存在
+  if (target.scope === 'global' && !existsSync(getGlobalDir())) {
+    mkdirSync(getGlobalDir(), { recursive: true })
+  }
+
+  // 1. 检查配置文件是否已存在
   if (existsSync(targetFile)) {
-    console.error('❌ 检测到已存在配置文件: .claudetalk.json')
-    console.error(`   绝对路径: ${targetFile}`)
+    console.error(`❌ 检测到已存在配置文件 (${scopeLabel}): ${targetFile}`)
     console.error('   无法执行自动配置。')
-    console.error('   如需重新配置，请手动删除 .claudetalk.json 文件。')
+    console.error(`   如需重新配置，请手动删除该文件。`)
     process.exit(1)
   }
 
@@ -261,8 +344,10 @@ async function autoSetup(workDir: string): Promise<void> {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('')
 
-  // 5. 询问是否将 CLAUDE.md 模板内容写入项目
-  await setupClaudeMd(workDir)
+  // 5. 询问是否将 CLAUDE.md 模板内容写入项目（仅本地配置；全局配置不涉及项目级文档）
+  if (target.scope === 'local') {
+    await setupClaudeMd(workDir)
+  }
 
   // 6. 按顺序逐个配置 Agent
   const allChannels = getAllChannelDescriptors()
@@ -369,17 +454,27 @@ async function autoSetup(workDir: string): Promise<void> {
         }
       }
 
-      // 自动创建 SubAgent 文件
-      await createSubagentFile(profileName, workDir, systemPrompt, subagentModel)
+      // 自动创建 SubAgent 文件（路径按 setup 范围分流）
+      await createSubagentFile(profileName, target.agentsDir, systemPrompt, subagentModel)
     }
 
-    // 4.6 保存配置
+    // 4.6 项目监督者询问（基于 updatedConfig 当前累积状态判断已设监督者）
+    const supervisorDecision = await promptSupervisorRole(updatedConfig, profileName)
+    if (supervisorDecision.conflictsToClear.length > 0) {
+      updatedConfig.profiles = clearSupervisorRoleOn(
+        updatedConfig.profiles ?? {},
+        supervisorDecision.conflictsToClear
+      )
+    }
+
+    // 4.7 保存配置
     const profileConfig: ProfileConfig = {
       channel: channelType,
       [channelType]: channelConfig,
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(enableSubagent ? { subagentEnabled: true } : {}),
       ...(subagentModel ? { subagentModel } : {}),
+      ...(supervisorDecision.enabled ? { supervisorRole: true } : {}),
     }
 
     updatedConfig.profiles![profileName] = profileConfig
@@ -392,7 +487,7 @@ async function autoSetup(workDir: string): Promise<void> {
   // 5. 保存所有配置
   saveRawConfig(updatedConfig, targetFile)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-  console.log(`✅ 所有 Agent 配置已保存到 ${targetFile}`)
+  console.log(`✅ 所有 Agent 配置已保存到 (${scopeLabel}): ${targetFile}`)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('')
   console.log('配置完成！运行以下命令启动机器人：')
@@ -409,14 +504,15 @@ async function autoSetup(workDir: string): Promise<void> {
 /**
  * 编辑已有配置 - 列出已有 profile，用户选择后重新配置（支持修改 profile 名称）
  */
-async function editSetup(workDir: string): Promise<void> {
-  const targetFile = join(workDir, LOCAL_CONFIG_FILENAME)
+async function editSetup(workDir: string, opts: { global?: boolean } = {}): Promise<void> {
+  const target = getSetupTarget(workDir, !!opts.global)
+  const targetFile = target.configPath
+  const scopeLabel = target.scope === 'global' ? '全局' : '本地'
 
-  // 1. 检查 .claudetalk.json 是否存在
+  // 1. 检查配置文件是否存在
   if (!existsSync(targetFile)) {
-    console.error('❌ 未找到配置文件: .claudetalk.json')
-    console.error(`   期望路径: ${targetFile}`)
-    console.error('   请先运行 claudetalk --setup 或 claudetalk --setup auto 进行初始配置。')
+    console.error(`❌ 未找到${scopeLabel}配置文件: ${targetFile}`)
+    console.error(`   请先运行 claudetalk --setup${opts.global ? ' auto --global' : ''} 进行初始配置。`)
     process.exit(1)
   }
 
@@ -433,7 +529,7 @@ async function editSetup(workDir: string): Promise<void> {
   console.log('')
   console.log('✏️  ClaudeTalk 配置编辑')
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-  console.log(`📁 配置文件: ${targetFile}`)
+  console.log(`📁 配置文件: ${targetFile} (${scopeLabel})`)
   console.log('')
   console.log('已有 profile 列表:')
   profileNames.forEach((name, index) => {
@@ -460,10 +556,25 @@ async function editSetup(workDir: string): Promise<void> {
   const newProfileNameInput = await promptInput(`新的 profile 名称 [${selectedProfileName}]: `)
   const newProfileName = newProfileNameInput.trim() || selectedProfileName
 
-  // 4. 走完整的交互式配置流程（复用 interactiveSetup 的逻辑）
-  await interactiveSetup(workDir, selectedProfileName)
+  // 3.5 若有重命名意图，提前做防覆盖检查（先于交互式配置，避免用户填完一长串才被告知冲突）
+  if (newProfileName !== selectedProfileName) {
+    if (existingRaw?.profiles?.[newProfileName]) {
+      console.error(`❌ 目标 profile 名 [${newProfileName}] 已存在于 ${targetFile}`)
+      console.error('   请先 claudetalk --setup edit 删除/改名目标 profile，再来重命名。')
+      process.exit(1)
+    }
+    const targetAgentMd = join(target.agentsDir, `${newProfileName}.md`)
+    if (existsSync(targetAgentMd)) {
+      console.error(`❌ 目标 SubAgent 文件已存在: ${targetAgentMd}`)
+      console.error('   该文件可能属于另一个角色，重命名会覆盖它的内容。请先手动处理后再来。')
+      process.exit(1)
+    }
+  }
 
-  // 5. 如果 profile 名称有变更，执行重命名
+  // 4. 走完整的交互式配置流程（复用 interactiveSetup 的逻辑）
+  await interactiveSetup(workDir, selectedProfileName, { global: opts.global })
+
+  // 5. 如果 profile 名称有变更，执行重命名（JSON + SubAgent .md 同步）
   if (newProfileName !== selectedProfileName) {
     const updatedRaw = loadRawConfig(targetFile)
     if (updatedRaw?.profiles) {
@@ -475,6 +586,20 @@ async function editSetup(workDir: string): Promise<void> {
         console.log(`✅ Profile 已从 [${selectedProfileName}] 重命名为 [${newProfileName}]`)
       }
     }
+    // 同步 rename SubAgent 文件（仅当旧 .md 存在时；目标已在前面校验过不存在）
+    const oldAgentMd = join(target.agentsDir, `${selectedProfileName}.md`)
+    const newAgentMd = join(target.agentsDir, `${newProfileName}.md`)
+    if (existsSync(oldAgentMd)) {
+      try {
+        renameSync(oldAgentMd, newAgentMd)
+        console.log(`✅ SubAgent 文件已重命名: ${oldAgentMd} → ${newAgentMd}`)
+      } catch (error) {
+        console.error(`⚠️  SubAgent 文件重命名失败: ${error instanceof Error ? error.message : String(error)}`)
+        console.error(`   旧文件: ${oldAgentMd}`)
+        console.error(`   新文件: ${newAgentMd}`)
+        console.error('   请手动处理。')
+      }
+    }
   }
 
   console.log('')
@@ -484,11 +609,22 @@ async function editSetup(workDir: string): Promise<void> {
 
 // ========== 交互式配置向导 ==========
 
-async function interactiveSetup(workDir: string, profile?: string): Promise<void> {
-  const targetFile = join(workDir, LOCAL_CONFIG_FILENAME)
+async function interactiveSetup(
+  workDir: string,
+  profile?: string,
+  opts: { global?: boolean } = {}
+): Promise<void> {
+  const target = getSetupTarget(workDir, !!opts.global)
+  const targetFile = target.configPath
+  const scopeLabel = target.scope === 'global' ? '全局' : '本地'
 
   // 没有指定 profile 时使用 "default" 作为默认角色名
   const resolvedProfile = profile ?? 'default'
+
+  // 全局配置写入前先确保目录存在
+  if (target.scope === 'global' && !existsSync(getGlobalDir())) {
+    mkdirSync(getGlobalDir(), { recursive: true })
+  }
 
   const existingRaw = loadRawConfig(targetFile)
   const existingProfile = existingRaw?.profiles?.[resolvedProfile]
@@ -497,7 +633,7 @@ async function interactiveSetup(workDir: string, profile?: string): Promise<void
   console.log('🤖 ClaudeTalk 配置向导')
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log(`🎭 角色: ${resolvedProfile}`)
-  console.log(`📁 配置文件: ${targetFile}`)
+  console.log(`📁 配置文件: ${targetFile} (${scopeLabel})`)
   console.log('')
 
   // 1. 选择 Channel 类型（从注册表动态生成选项）
@@ -615,30 +751,39 @@ async function interactiveSetup(workDir: string, profile?: string): Promise<void
       }
     }
 
-    // 自动创建 SubAgent 文件
-    await createSubagentFile(resolvedProfile, workDir, systemPrompt, subagentModel)
+    // 自动创建 SubAgent 文件（路径按 setup 范围分流）
+    await createSubagentFile(resolvedProfile, target.agentsDir, systemPrompt, subagentModel)
   }
 
-  // 5. 保存配置
+  // 5. 项目监督者询问
+  const supervisorDecision = await promptSupervisorRole(existingRaw, resolvedProfile)
+
+  // 6. 保存配置
   const profileConfig: ProfileConfig = {
     channel: channelType,
     [channelType]: channelConfig,
     ...(systemPrompt ? { systemPrompt } : {}),
     ...(enableSubagent ? { subagentEnabled: true } : {}),
     ...(subagentModel ? { subagentModel } : {}),
+    ...(supervisorDecision.enabled ? { supervisorRole: true } : {}),
   }
+
+  const cleanedProfiles = clearSupervisorRoleOn(
+    existingRaw?.profiles ?? {},
+    supervisorDecision.conflictsToClear
+  )
 
   const updatedConfig: RawConfig = {
     ...existingRaw,
     profiles: {
-      ...(existingRaw?.profiles ?? {}),
+      ...cleanedProfiles,
       [resolvedProfile]: profileConfig,
     },
   }
 
   saveRawConfig(updatedConfig, targetFile)
   console.log('')
-  console.log(`✅ 角色 [${resolvedProfile}] 配置已保存到 ${targetFile}`)
+  console.log(`✅ 角色 [${resolvedProfile}] 配置已保存到 (${scopeLabel}): ${targetFile}`)
 }
 
 /**
@@ -646,14 +791,13 @@ async function interactiveSetup(workDir: string, profile?: string): Promise<void
  */
 async function createSubagentFile(
   profileName: string,
-  workDir: string,
+  agentsDir: string,
   systemPrompt?: string,
   model?: string
 ): Promise<void> {
-  // SubAgent 文件放在工作目录的 .claude/agents 下
-  // 符合 Claude Code 的标准 SubAgent 目录结构
-  // 每个项目可以有独立的 SubAgent 配置，与 profile 配置保持一致
-  const agentsDir = join(workDir, '.claude', 'agents')
+  // agentsDir 由 caller 决定：
+  //   本地 setup: {workDir}/.claude/agents
+  //   全局 setup: ~/.claudetalk/agents
   if (!existsSync(agentsDir)) mkdirSync(agentsDir, { recursive: true })
 
   const agentFile = join(agentsDir, `${profileName}.md`)
@@ -687,12 +831,23 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
   claudetalk --profile <name>                          启动指定角色机器人
   claudetalk --setup                                   配置当前目录默认角色（交互式）
   claudetalk --setup --profile <name>                  配置当前目录指定角色（交互式）
-  claudetalk --setup auto                              自动配置多个角色（根据 ~/.claudetalk/agent_auto_config.json）
-  claudetalk --setup edit                              编辑已有角色配置（支持修改 profile 名称）
+  claudetalk --setup auto                              自动配置多个角色（写入当前目录 .claudetalk.json）
+  claudetalk --setup auto --global                     自动配置多个角色（写入 ~/.claudetalk/config.json）
+  claudetalk --setup edit                              编辑当前目录已有角色配置
+  claudetalk --setup edit --global                     编辑全局配置中的已有角色
   claudetalk --setup claude                            将协作规范写入项目 CLAUDE.md（创建或追加）
   claudetalk --restart                                 重启当前目录的 ClaudeTalk 机器人
   claudetalk --restart --profile <name>                重启指定角色的机器人
   claudetalk --help                                    显示帮助信息
+
+配置查找顺序（启动时）:
+  1. 当前目录 .claudetalk.json
+  2. 全局 ~/.claudetalk/config.json
+  本地存在则只用本地（不与全局合并）；启动 banner 会显示实际使用的配置文件。
+
+实例锁机制（防止消息双消费）:
+  同一份 bot 凭据只允许在一个进程中运行。若在多目录同时启动会被全局锁拦下，
+  错误信息会提示已有进程的 PID 和工作目录。
 
 默认角色规则:
   - 不指定 --profile 时，优先使用名为 "default" 的角色
@@ -724,7 +879,10 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
   }
 
 配置文件:
-  .claudetalk.json              当前工作目录
+  .claudetalk.json                                     当前工作目录（本地）
+  ~/.claudetalk/config.json                            全局（用于跨目录复用）
+  ~/.claudetalk/agents/                                全局 SubAgent 文件目录
+  ~/.claudetalk/locks/                                 实例锁目录（自动管理）
 `)
     process.exit(0)
   }
@@ -800,24 +958,53 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
   // --setup
   if (process.argv.includes('--setup')) {
     const setupArgIndex = process.argv.indexOf('--setup')
-    const setupSubCommand = process.argv[setupArgIndex + 1]
+    // 跳过 --global 标志，取真正的子命令（auto / edit / claude / 无）
+    let setupSubCommand = process.argv[setupArgIndex + 1]
+    if (setupSubCommand === '--global') {
+      setupSubCommand = process.argv[setupArgIndex + 2]
+    }
+    const isGlobal = hasGlobalFlag()
 
     if (setupSubCommand === 'auto') {
-      // --setup auto 模式
-      await autoSetup(workDir)
+      // --setup auto [--global]
+      await autoSetup(workDir, { global: isGlobal })
     } else if (setupSubCommand === 'edit') {
-      // --setup edit 模式
-      await editSetup(workDir)
+      // --setup edit [--global]
+      await editSetup(workDir, { global: isGlobal })
     } else if (setupSubCommand === 'claude') {
-      // --setup claude 模式：单独配置项目 CLAUDE.md
+      // --setup claude 模式：单独配置项目 CLAUDE.md（项目级，不支持 --global）
+      if (isGlobal) {
+        console.error('❌ --setup claude 不支持 --global（CLAUDE.md 为项目级文档）')
+        process.exit(1)
+      }
       await setupClaudeMd(workDir)
     } else {
-      // --setup 交互式模式
-      await interactiveSetup(workDir, profile)
+      // --setup 交互式模式 [--global]
+      await interactiveSetup(workDir, profile, { global: isGlobal })
       const resolvedSetupProfile = profile ?? 'default'
       console.log(`配置完成！运行 claudetalk --profile ${resolvedSetupProfile} 启动机器人。`)
     }
     process.exit(0)
+  }
+
+  // 解析配置来源（本地优先，回退全局）
+  const resolved = resolveConfigPath(workDir)
+
+  // 监督者唯一性校验（同 workDir 下 supervisorRole=true 的 profile 必须 ≤ 1）
+  if (resolved) {
+    const rawForCheck = loadRawConfig(resolved.path)
+    const supervisors = Object.entries(rawForCheck?.profiles ?? {})
+      .filter(([, p]) => (p as ProfileConfig).supervisorRole === true)
+      .map(([name]) => name)
+    if (supervisors.length > 1) {
+      console.error('')
+      console.error(`❌ 一个项目只能配置一个监督者，但检测到多个：${supervisors.join(', ')}`)
+      console.error(`   配置文件: ${resolved.path}`)
+      console.error('   请编辑配置去掉多余 profile 的 supervisorRole 字段：')
+      console.error('     claudetalk --setup edit')
+      console.error('')
+      process.exit(1)
+    }
   }
 
   // 指定了 --profile 时，只启动该角色
@@ -826,6 +1013,11 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
     console.log('🚀 ClaudeTalk 启动中...')
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
     console.log(`📁 工作目录: ${workDir}`)
+    if (resolved) {
+      console.log(`📋 配置文件: ${resolved.path} (${resolved.source === 'local' ? '本地' : '全局'})`)
+    } else {
+      console.log(`📋 配置文件: 未找到（启动后会报错）`)
+    }
     console.log(`🎭 角色: ${profile}`)
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
     console.log('')
@@ -834,15 +1026,21 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
   }
 
   // 未指定 --profile 时，读取配置文件中所有 profile 并全部启动
-  const localConfig = loadRawConfig(join(workDir, LOCAL_CONFIG_FILENAME))
+  if (!resolved) {
+    console.error('❌ 未找到任何配置文件，请先运行：')
+    console.error('   claudetalk --setup --profile <name>           # 写入当前目录')
+    console.error('   claudetalk --setup auto --global              # 写入全局 ~/.claudetalk/config.json')
+    console.error('')
+    console.error('运行 claudetalk --help 查看完整用法。')
+    process.exit(1)
+  }
+  const localConfig = loadRawConfig(resolved.path)
   const profiles = localConfig?.profiles ?? {}
   const profileNames = Object.keys(profiles)
 
   if (profileNames.length === 0) {
-    console.error('❌ 未找到任何 profile 配置，请先运行：')
-    console.error('   claudetalk --setup --profile <name>')
-    console.error('')
-    console.error('运行 claudetalk --help 查看完整用法。')
+    console.error(`❌ 配置文件中没有任何 profile (${resolved.path})`)
+    console.error('   请先运行 claudetalk --setup 或 claudetalk --setup auto 进行配置。')
     process.exit(1)
   }
 
@@ -850,6 +1048,7 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
   console.log('🚀 ClaudeTalk 启动中...')
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log(`📁 工作目录: ${workDir}`)
+  console.log(`📋 配置文件: ${resolved.path} (${resolved.source === 'local' ? '本地' : '全局'})`)
   console.log(`🎭 启动所有角色: ${profileNames.join(', ')}`)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('')

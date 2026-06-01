@@ -8,6 +8,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import type { ChannelType, ClaudeTalkConfig } from '../types.js'
 import { createLogger, log } from './logger.js'
+import { getGlobalAgentsDir, resolveConfigPath } from './global-config.js'
 
 // Re-export for index.ts compatibility
 export { createLogger, log } from './logger.js'
@@ -174,8 +175,9 @@ function loadConfigFromFile(filePath: string, profile?: string): ClaudeTalkConfi
 }
 
 export function loadConfig(workDir: string, profile?: string): ClaudeTalkConfig | null {
-  const localConfigFile = join(workDir, '.claudetalk.json')
-  return loadConfigFromFile(localConfigFile, profile)
+  const resolved = resolveConfigPath(workDir)
+  if (!resolved) return null
+  return loadConfigFromFile(resolved.path, profile)
 }
 
 // ========== SubAgent 构建 ==========
@@ -192,8 +194,15 @@ function parseAgentMdFile(workDir: string, profileName: string): {
   tools?: string[]
   disallowedTools?: string[]
 } | null {
-  const agentFilePath = join(workDir, '.claude', 'agents', `${profileName}.md`)
-  if (!existsSync(agentFilePath)) {
+  // 查找顺序：本地 {workDir}/.claude/agents/ → 全局 ~/.claudetalk/agents/
+  const localAgentPath = join(workDir, '.claude', 'agents', `${profileName}.md`)
+  const globalAgentPath = join(getGlobalAgentsDir(), `${profileName}.md`)
+  const agentFilePath = existsSync(localAgentPath)
+    ? localAgentPath
+    : existsSync(globalAgentPath)
+    ? globalAgentPath
+    : null
+  if (!agentFilePath) {
     return null
   }
 

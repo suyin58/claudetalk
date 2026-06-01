@@ -115,6 +115,7 @@ interface ChatMember {
   openId?: string;      // open_id（ou_ 开头），用于识别实时消息的 sender
   unionId?: string;     // 用户的 union_id（on_ 开头），用于 @ 用户
   appId?: string;       // 机器人的 app_id（cli_ 开头），用于 @ 机器人
+  profileName?: string; // 机器人专有：本机器人对应的 ClaudeTalk profile 名，供监督等模块反查
 }
 type ChatMembersConfig = Record<string, Array<ChatMember>>;
 
@@ -563,19 +564,28 @@ export class FeishuClient implements Channel {
         const config = this.loadChatMembersConfig();
         let updated = false;
 
-        // 遍历所有群聊，更新机器人信息
+        const selfProfileName = this.config.profileName;
+
+        // 遍历所有群聊，更新机器人信息（跳过 _bot_self 段，下面单独处理以避免双重 upsert）
         for (const chatId in config) {
+          if (chatId === '_bot_self') continue;
           const members = config[chatId];
           const existingIndex = members.findIndex(m => m.name === app_name);
 
           if (existingIndex >= 0) {
             // 更新现有机器人信息
             const existing = members[existingIndex];
-            if (existing.type !== 'bot' || existing.openId !== open_id || existing.appId !== appId) {
+            if (
+              existing.type !== 'bot' ||
+              existing.openId !== open_id ||
+              existing.appId !== appId ||
+              existing.profileName !== selfProfileName
+            ) {
               existing.type = 'bot';
               existing.openId = open_id;
               existing.appId = appId;
-              this.logger(`Updated bot in chat ${chatId}: name=${app_name}, openId=${open_id}, appId=${appId}`);
+              existing.profileName = selfProfileName;
+              this.logger(`Updated bot in chat ${chatId}: name=${app_name}, openId=${open_id}, appId=${appId}, profileName=${selfProfileName}`);
               updated = true;
             }
           } else {
@@ -584,26 +594,42 @@ export class FeishuClient implements Channel {
               name: app_name,
               type: 'bot',
               openId: open_id,
-              appId: appId
+              appId: appId,
+              profileName: selfProfileName,
             });
-            this.logger(`Added bot to chat ${chatId}: name=${app_name}, openId=${open_id}, appId=${appId}`);
+            this.logger(`Added bot to chat ${chatId}: name=${app_name}, openId=${open_id}, appId=${appId}, profileName=${selfProfileName}`);
             updated = true;
           }
         }
 
-        // 如果配置文件为空（首次启动），创建一个默认群聊条目存储机器人信息
-        // 这样可以确保 chat-members.json 文件始终包含当前机器人的信息
-        if (Object.keys(config).length === 0) {
-          const defaultChatId = '_bot_self'; // 特殊标识，表示机器人自身信息
-          config[defaultChatId] = [{
-            name: app_name,
-            type: 'bot',
-            openId: open_id,
-            appId: appId
-          }];
-          this.logger(`Created default bot entry: name=${app_name}, openId=${open_id}, appId=${appId}`);
+        // 幂等 upsert _bot_self：按 appId 去重，每次启动都 ensure 自己在
+        // 修复点：原实现只在 config 完全为空时才创建 _bot_self，导致同 workDir 第二个 profile 启动时无法注册
+        const botSelf: ChatMember[] = config['_bot_self'] || [];
+        const selfIdx = botSelf.findIndex(m => m.appId === appId);
+        const desired: ChatMember = {
+          name: app_name,
+          type: 'bot',
+          openId: open_id,
+          appId: appId,
+          profileName: selfProfileName,
+        };
+        if (selfIdx >= 0) {
+          const cur = botSelf[selfIdx];
+          if (
+            cur.name !== desired.name ||
+            cur.openId !== desired.openId ||
+            cur.profileName !== desired.profileName
+          ) {
+            botSelf[selfIdx] = { ...cur, ...desired };
+            this.logger(`Updated _bot_self entry: name=${app_name}, profileName=${selfProfileName}`);
+            updated = true;
+          }
+        } else {
+          botSelf.push(desired);
+          this.logger(`Registered self to _bot_self: name=${app_name}, profileName=${selfProfileName}, appId=${appId}`);
           updated = true;
         }
+        config['_bot_self'] = botSelf;
 
         if (updated) {
           this.saveChatMembersConfig(config);

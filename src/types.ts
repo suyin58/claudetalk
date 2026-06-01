@@ -368,6 +368,16 @@ export interface FeishuProfileConfig {
   FEISHU_APP_SECRET: string
 }
 
+/** 监督参数（项目经理 agent 的可调参数，全部可选） */
+export interface SupervisionConfig {
+  /** 检查间隔（ms），默认 20 分钟 */
+  checkIntervalMs?: number
+  /** 停滞阈值（ms），最后一条消息距今超过此值才考虑介入；默认 10 分钟 */
+  staleThresholdMs?: number
+  /** 介入后冷却（ms），同群在此窗口内不再次介入；默认 20 分钟 */
+  cooldownMs?: number
+}
+
 /** ClaudeTalk Profile 配置 */
 export interface ProfileConfig {
   /** 消息通道类型，必填 */
@@ -387,6 +397,10 @@ export interface ProfileConfig {
     allow?: string[]
     deny?: string[]
   }
+  /** 标记为项目监督者：周期性检查群聊停滞并自动 @ 跟进；同一 workDir 最多 1 个 */
+  supervisorRole?: boolean
+  /** 监督参数（仅 supervisorRole=true 时生效） */
+  supervision?: SupervisionConfig
   /** 索引签名：支持动态 Channel 类型的嵌套配置（如 wechat、slack 等） */
   [channelKey: string]: unknown
 }

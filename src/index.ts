@@ -6,9 +6,11 @@
 import { getChannelDescriptor } from './channels/index.js'
 import { callClaude, clearSession, createLogger, findLastActivePrivateSession, loadConfig } from './core/claude.js'
 import { closeLogFile, initLogFile } from './core/logger.js'
+import { acquireBotLock, extractCredential, releaseBotLock } from './core/instance-lock.js'
+import { startSupervision, type SupervisionRuntime } from './core/supervision.js'
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
-import type { Channel, ChannelMessageContext, ClaudeTalkConfig } from './types.js'
+import type { Channel, ChannelMessageContext, ClaudeTalkConfig, SupervisionConfig } from './types.js'
 
 export interface StartBotOptions {
   workDir: string
@@ -84,6 +86,39 @@ export async function startBot(options: StartBotOptions): Promise<void> {
 
   logger(`[startBot] Starting channel=${channelType}, workDir=${workDir}`)
 
+  // 实例锁：按 bot 凭据指纹隔离，防止同一份配置在多目录/多进程下被并发消费
+  const channelConfig = (config[channelType] ?? {}) as Record<string, unknown>
+  const credential = extractCredential(channelType, channelConfig)
+  if (!credential) {
+    logger(`[startBot] WARNING: channel "${channelType}" 没有可用凭据指纹，跳过实例锁`)
+  }
+
+  if (credential) {
+    const acquire = acquireBotLock({
+      channel: channelType,
+      credential,
+      pid: process.pid,
+      workDir,
+      profile,
+    })
+    if (!acquire.ok) {
+      const existing = acquire.existing
+      console.error('')
+      console.error('❌ 该 bot 已在以下位置运行，不能同时启动多个实例（避免消息双消费）：')
+      console.error(`   PID:        ${existing.pid}`)
+      console.error(`   工作目录:   ${existing.workDir}`)
+      console.error(`   角色:       ${existing.profile ?? '(default)'}`)
+      console.error(`   Channel:    ${existing.channel}`)
+      console.error(`   启动时间:   ${existing.startedAt}`)
+      console.error('')
+      console.error(`💡 请先在该目录运行 \`claudetalk --restart\` 或手动 kill ${existing.pid}。`)
+      console.error('')
+      closeLogFile()
+      process.exit(2)
+    }
+    logger(`[startBot] Bot lock acquired: ${acquire.lockKey}`)
+  }
+
   // 创建 .claudetalk 目录（如果不存在）
   const claudetalkDir = join(workDir, '.claudetalk')
   if (!existsSync(claudetalkDir)) {
@@ -107,27 +142,56 @@ export async function startBot(options: StartBotOptions): Promise<void> {
     }
   }
 
+  // 释放实例锁（仅当持有时）
+  const releaseLock = () => {
+    if (!credential) return
+    try {
+      releaseBotLock(channelType, credential, process.pid)
+      logger(`[startBot] Bot lock released`)
+    } catch (error) {
+      logger(`[startBot] Failed to release bot lock: ${error}`)
+    }
+  }
+
+  // 监督运行时（项目经理 profile 启动时填入）
+  let supervisionRuntime: SupervisionRuntime | null = null
+  const stopSupervision = () => {
+    if (!supervisionRuntime) return
+    try {
+      supervisionRuntime.stop()
+    } catch (error) {
+      logger(`[startBot] Failed to stop supervision: ${error}`)
+    }
+    supervisionRuntime = null
+  }
+
   // 注册进程退出时的清理
-  // 注意：SIGINT/SIGTERM 中已显式调用 cleanupPidFile，exit 事件仅作兜底（existsSync 保护防重复删除）
+  // 注意：SIGINT/SIGTERM 中已显式调用清理，exit 事件仅作兜底（existsSync 保护防重复删除）
   process.on('SIGINT', () => {
     logger('[startBot] Received SIGINT, shutting down...')
+    stopSupervision()
     channel.stop()
     cleanupPidFile()
+    releaseLock()
     closeLogFile()
     process.exit(0)
   })
 
   process.on('SIGTERM', () => {
     logger('[startBot] Received SIGTERM, shutting down...')
+    stopSupervision()
     channel.stop()
     cleanupPidFile()
+    releaseLock()
     closeLogFile()
     process.exit(0)
   })
 
   process.on('exit', () => {
-    // 兜底清理：确保异常退出时也能清理 PID 文件和日志
+    // 兜底清理：确保异常退出时也能清理 PID 文件、锁和日志
+    stopSupervision()
     cleanupPidFile()
+    releaseLock()
     closeLogFile()
   })
 
@@ -203,6 +267,23 @@ export async function startBot(options: StartBotOptions): Promise<void> {
     if (lastSession?.userId) {
       await channel.sendOnlineNotification(lastSession.userId, workDir).catch((error) => {
         logger(`[notify] 上线通知发送失败: ${error}`)
+      })
+    }
+  }
+
+  // 项目监督者：启动监督循环（仅 supervisorRole=true 的 profile）
+  if (config.supervisorRole === true) {
+    if (!profile) {
+      logger('[supervisor] 监督功能需要 --profile，跳过')
+    } else {
+      const supervisionConfig: SupervisionConfig = (config.supervision as SupervisionConfig | undefined) ?? {}
+      supervisionRuntime = startSupervision({
+        workDir,
+        profile,
+        channelType,
+        channel,
+        channelConfig,
+        config: supervisionConfig,
       })
     }
   }
