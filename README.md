@@ -453,7 +453,7 @@ ClaudeTalk 启动时会按 **bot 凭据指纹** 建立全局运行时锁，**同
 **LLM 输出与校验**：
 - LLM 必须输出结构化 JSON `{shouldFollowUp, mention, message, reason}`
 - `mention` 只填 profileName，`message` 是**纯文本正文**——`<at>` 标签由代码用 `Channel.formatMention()` 后置组装并 prepend；LLM 不需要也不应自己写标签
-- LLM 看到的 agent 列表**包含 self（监督者自己）**并明确标 `⚠️ 这是你自己`，附带"@ self 会引发 1 轮自答自，然后自激保护会自动跳过"的说明，由 LLM 自行决策何时选 self、何时输出 `shouldFollowUp: false`
+- LLM 看到的 agent 列表**包含 self（监督者自己）**并明确标 `⚠️ 这是你自己`，附带"@ self 会引发 1 轮自答自；系统不再自动跳过，由你下次 tick 自行判断是否继续介入"的说明，由 LLM 自行决策何时选 self、何时输出 `shouldFollowUp: false`
 - JSON 解析失败时有 best-effort fixer 兜底：自动转义字符串值内未转义的半角双引号（中文 LLM 常见错误）
 - 任何校验失败（含 parse 失败、mention 不合法、message 缺失）都会把 LLM 原始 decision 序列化打到日志，方便定位
 - 校验失败重试一次再 drop；LLM 调用 60s 超时即 drop 本群
@@ -462,7 +462,7 @@ ClaudeTalk 启动时会按 **bot 凭据指纹** 建立全局运行时锁，**同
 - 一个工作目录下 `supervisorRole: true` 的 profile **最多 1 个**，启动时校验，超过会报错退出
 - 监督独立 session（`supervision-{chatId}`），调用前 `clearSession`，不污染项目经理自己的对话上下文
 - supervisor 调 LLM 时 `profile=undefined`——不注入任何角色 systemPrompt（避免 PM 身份污染严格的 JSON 判官指令）
-- 「最后一条是项目经理自己发的」会跳过本轮，是 @ self 后的自激保护兜底
+- 不再用「最后一条是项目经理自己 → 自动跳过」的硬 guard：会误伤 PM 发完无 @ 总结后流程真卡死的情况；改由 LLM 看到完整最近消息后自行判断要不要再介入
 - 群成员列表由 `chat-members.json` 自动维护（机器人启动时注册自己到 `_bot_self`）
 
 ## 配置文件
