@@ -40,9 +40,29 @@ interface RecentMessage {
 
 interface FollowUpDecision {
   shouldFollowUp: boolean
+  /** 要 @ 的目标 profileName（仅是 key，<at> 标签由代码后置组装） */
   mention?: string
+  /** 跟进文案正文（不含 @ 标签） */
   message?: string
   reason?: string
+}
+
+/**
+ * BotInfo 携带所有 routing ID（不同 channel 用不同字段），不再强制 openId。
+ * - feishu: openId + appId 都有
+ * - dingtalk: clientId
+ *
+ * isSelf: 当前 supervisor 进程对应的 bot（即 pm 本身）。
+ * 不再从列表里剔除，而是把信息透明给 LLM，由 LLM 基于历史判断要不要 @ 自己。
+ * 自激保护已由 checkOneChat 里的「最后说话人是自己 → 跳过」兜底（最多 1 轮自答自答）。
+ */
+interface BotInfo {
+  profileName: string
+  displayName: string
+  openId?: string
+  appId?: string
+  clientId?: string
+  isSelf?: boolean
 }
 
 export interface SupervisionRuntime {
@@ -92,11 +112,17 @@ export function startSupervision(params: StartSupervisionParams): SupervisionRun
     }
   }
 
+  // 启动时延迟随机 5-15s 跑首次 tick：
+  // - 不必等满 checkIntervalMs 才能检测停滞
+  // - 多 bot 进程同时启动 / 单进程重启 时错峰，避免对 LLM 和 IM API 集中爆发
+  const firstTickDelayMs = 5_000 + Math.floor(Math.random() * 10_000)
+  const firstTickTimer = setTimeout(() => { void tick() }, firstTickDelayMs)
   const handle = setInterval(() => { void tick() }, settings.checkIntervalMs)
 
   return {
     stop() {
       stopped = true
+      clearTimeout(firstTickTimer)
       clearInterval(handle)
       logger('监督循环已停止')
     }
@@ -130,18 +156,40 @@ async function runOneCheck(
   }
 
   const botSelf = chatMembers['_bot_self'] || []
-  const botProfiles = botSelf
-    .map(b => (b as { profileName?: string }).profileName)
-    .filter((p): p is string => !!p && p !== params.profile)
+  // profileName 比对 case-insensitive，防止配置大小写不一致影响 self 标记
+  const selfKey = params.profile.toLowerCase()
+  // 按 profileName 去重：多次注册可能写入重复条目，保留第一条即可
+  const seen = new Set<string>()
+  const botInfos: BotInfo[] = botSelf
+    .map((b): BotInfo | null => {
+      const x = b as { profileName?: string; name?: string; openId?: string; appId?: string; clientId?: string }
+      if (!x.profileName || !x.name) return null
+      const profileLower = x.profileName.toLowerCase()
+      if (seen.has(profileLower)) return null
+      seen.add(profileLower)
+      return {
+        profileName: x.profileName,
+        displayName: x.name,
+        openId: x.openId,
+        appId: x.appId,
+        clientId: x.clientId,
+        isSelf: profileLower === selfKey,
+      }
+    })
+    .filter((x): x is BotInfo => x !== null)
 
-  if (botProfiles.length === 0) {
-    logger('暂无其他 agent profile，跳过本轮')
+  if (botInfos.length === 0) {
+    logger('暂无任何 agent（_bot_self 为空），跳过本轮')
+    return
+  }
+  if (botInfos.every(b => b.isSelf)) {
+    logger('_bot_self 中仅有 supervisor 自己，无其他 agent 可调度，跳过本轮')
     return
   }
 
   const now = Date.now()
   for (const chatId of chatIds) {
-    await checkOneChat(chatId, params, settings, lastInterventionAt, botProfiles, now, logger)
+    await checkOneChat(chatId, params, settings, lastInterventionAt, botInfos, now, logger)
   }
 }
 
@@ -150,7 +198,7 @@ async function checkOneChat(
   params: StartSupervisionParams,
   settings: { staleThresholdMs: number; cooldownMs: number },
   lastInterventionAt: Map<string, number>,
-  botProfiles: string[],
+  botInfos: BotInfo[],
   now: number,
   logger: (msg: string) => void
 ): Promise<void> {
@@ -182,7 +230,7 @@ async function checkOneChat(
     let decision: FollowUpDecision
     try {
       decision = await withTimeout(
-        askLLMForDecision(params, chatId, recent, botProfiles, idle),
+        askLLMForDecision(params, chatId, recent, botInfos, idle),
         LLM_TIMEOUT_MS,
         `[${chatId}] LLM 调用`
       )
@@ -190,12 +238,12 @@ async function checkOneChat(
       logger(`[${chatId}] LLM 调用超时或失败，drop: ${error instanceof Error ? error.message : String(error)}`)
       return
     }
-    let validation = validateDecision(decision, botProfiles)
+    let validation = validateDecision(decision, botInfos)
     if (!validation.ok) {
       logger(`[${chatId}] LLM 输出校验失败 (${validation.reason ?? 'unknown'})，重试一次...`)
       try {
         decision = await withTimeout(
-          askLLMForDecision(params, chatId, recent, botProfiles, idle),
+          askLLMForDecision(params, chatId, recent, botInfos, idle),
           LLM_TIMEOUT_MS,
           `[${chatId}] LLM 重试`
         )
@@ -203,7 +251,7 @@ async function checkOneChat(
         logger(`[${chatId}] LLM 重试超时或失败，drop: ${error instanceof Error ? error.message : String(error)}`)
         return
       }
-      validation = validateDecision(decision, botProfiles)
+      validation = validateDecision(decision, botInfos)
       if (!validation.ok) {
         logger(`[${chatId}] LLM 输出校验仍失败 (${validation.reason ?? 'unknown'})，drop`)
         return
@@ -215,8 +263,23 @@ async function checkOneChat(
       return
     }
 
-    logger(`[${chatId}] 介入: @${decision.mention} -> ${decision.message!.substring(0, 80)}`)
-    await params.channel.sendMessage(chatId, decision.message!, true)
+    // validateDecision 已确保 target 必存在；这里 ! 断言简化代码
+    const target = botInfos.find(b => b.profileName === decision.mention)!
+    // 若 LLM 选了 self（pm 自己），单独打一条 log 便于审计（不阻拦，由 LLM 自主判断）
+    if (target.isSelf) {
+      logger(`[${chatId}] LLM 选择 @ self (${target.profileName})，将触发一轮自答；reason=${decision.reason ?? '(no reason)'}`)
+    }
+    // 由代码组装 channel 专属 @ 标签，LLM 的 message 只是纯文本正文
+    const tag = params.channel.formatMention({
+      profileName: target.profileName,
+      displayName: target.displayName,
+      openId: target.openId,
+      appId: target.appId,
+      clientId: target.clientId,
+    })
+    const finalMessage = `${tag} ${decision.message!.trim()}`
+    logger(`[${chatId}] 介入: @${target.displayName}(${target.profileName}) -> ${finalMessage.substring(0, 100)}`)
+    await params.channel.sendMessage(chatId, finalMessage, true)
     lastInterventionAt.set(chatId, now)
   } catch (error) {
     logger(`[${chatId}] 检查失败: ${error}`)
@@ -313,8 +376,11 @@ async function fetchFeishuRecent(
     } else {
       text = `(${item.msg_type})`
     }
+    // 飞书 create_time 是毫秒字符串，偶发返回空/非数字时退回 now，避免下游 NaN 比较把停滞群静默吞掉
+    const tsParsed = parseInt(item.create_time, 10)
+    const ts = Number.isFinite(tsParsed) ? tsParsed : Date.now()
     return {
-      timestamp: parseInt(item.create_time, 10),  // 飞书 create_time 是毫秒字符串
+      timestamp: ts,
       senderProfile,
       text,
     }
@@ -325,45 +391,87 @@ async function askLLMForDecision(
   params: StartSupervisionParams,
   chatId: string,
   recent: RecentMessage[],
-  botProfiles: string[],
+  botInfos: BotInfo[],
   idleMs: number
 ): Promise<FollowUpDecision> {
+  if (botInfos.length === 0) {
+    throw new Error('askLLMForDecision called with empty botInfos')
+  }
   const idleMinutes = Math.round(idleMs / 60000)
   const recentLines = recent.map(r => {
     const sender = r.senderProfile ? `@${r.senderProfile}` : '(用户)'
-    const time = new Date(r.timestamp).toLocaleString('zh-CN')
+    const time = new Date(r.timestamp).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
     return `[${time}] ${sender}: ${r.text}`
   }).join('\n')
 
+  // 给 LLM 看的 agent 列表只暴露选择必需的两个字段：profileName + 显示名
+  // routing ID（openId/appId/clientId）由代码内部组装 <at> 标签，LLM 不需要也不应触碰
+  const memberLines = botInfos
+    .map(b => b.isSelf
+      ? `- profileName=${b.profileName}（显示名：${b.displayName}）⚠️ **这是你自己**（项目监督者本人）`
+      : `- profileName=${b.profileName}（显示名：${b.displayName}）`
+    )
+    .join('\n')
+  const selfBot = botInfos.find(b => b.isSelf)
+  const selfProfile = selfBot?.profileName ?? '(未知)'
+
   const prompt = `你是项目监督者，负责检测群聊是否卡住并补一刀 @。下面是某 IM 群的最近消息记录，已停滞 ${idleMinutes} 分钟。
 
-群里可被 @ 的 agent 列表：${botProfiles.join(', ')}
+## 群里可被 @ 的 agent
+
+${memberLines}
+
+### 关于 @ 你自己（mention=${selfProfile}）的特殊说明
+
+如果你判断流程下一步该由项目经理本人推进，可以选 mention=${selfProfile}，但要意识到这条 @ 的实际效果：
+1. ${selfProfile} 收到 @ → 给出一次回复 → 群里"最后说话人"变成 ${selfProfile}
+2. 你下次 tick 时会因「最后一条是项目经理自己发的」而自动跳过该轮（这是已有的自激保护）
+3. 即：最多 1 轮"自答自"，之后流程暂停等下一个外部输入
+
+请基于历史**自行判断**该选哪种：
+- 若对话状态是「需要项目经理给出阶段性指令 / 总结 / 决定下一步」 → 选 mention=${selfProfile} 是合理的，那 1 轮自答能起到推进作用
+- 若对话状态是「等外部人类决策 / 等甲方回复 / 等不可控的外部输入」 → 选 mention=${selfProfile} 没意义（自己也答不了），**应输出 shouldFollowUp: false**
+- 若某个具体业务 agent（如 front/back/test/...）有明显未交付的工作 → 优先 @ 那个 agent，比 @ ${selfProfile} 更直接
 
 最近消息（按时间正序）：
 ${recentLines}
 
 请判断：
 1. 当前对话流程是否真的"卡住了"需要监督者介入（例如某 agent 漏 @ 下一个 agent；或用户提了问题没人接），还是已经自然结束/暂停（用户说"算了/结束"等）。
-2. 如果需要介入，该 @ 列表里哪个 agent 把流程续上。
-3. 给出简短的跟进文案，**必须包含字面 @{agent_name}**。
+2. 如果需要介入，该 @ 哪个 agent 把流程续上。从上表 profileName 中选一个填到 mention 字段（含上文「特殊说明」的考量）。
+3. 给出简短跟进文案放到 message 字段，**纯文本正文即可，不要写 @ 标签**——@ 标签会由系统按当前频道（飞书/钉钉）的规范自动组装并前置到你的文案前。
 
 仅输出一段 JSON，严格遵守以下格式，不要任何额外文字、说明或代码块标记：
 
-{"shouldFollowUp": true 或 false, "mention": "<agent_name>", "message": "<跟进文案，含 @{agent_name}>", "reason": "<判断理由，简短>"}
+{"shouldFollowUp": true 或 false, "mention": "<profileName>", "message": "<跟进正文，纯文本>", "reason": "<判断理由，简短>"}
+
+**⚠️ JSON 字符串格式约束（极重要）**：
+message 与 reason 字段是 JSON 字符串，内部若需引用某段话，**严禁使用半角双引号 "**——必须改用中文引号 「」 或英文单引号 ''。半角双引号会让 JSON 解析失败、消息发不出去。
+- ✘ 错误："message": "他说"已完成"了" ← 内部双引号会断开 JSON 字符串
+- ✓ 正确："message": "他说「已完成」了"
+- ✓ 正确："message": "他说'已完成'了"
+
+示例：
+
+{"shouldFollowUp": true, "mention": "${botInfos[0].profileName}", "message": "请补充上次评审的待澄清项。", "reason": "已停滞 30 分钟，需求评审待${botInfos[0].displayName}接力。"}
 
 若 shouldFollowUp 为 false，mention 与 message 可省略。`
 
   // 监督判断本质无状态。每次都用同一 conversationId（避免 session 文件无限累积），
   // 但调用前 clearSession 一次，确保上一次的输出/重试错误不会作为上下文污染本次判断。
+  //
+  // 关键：profile 显式传 undefined —— 不希望主循环被注入 PM 角色 systemPrompt（否则 LLM
+  // 同时被告知「你是项目经理」和「你是严格输出 JSON 的监督判官」，回答会偏散文 → JSON 解析必失败）。
+  // clearSession 也必须用 undefined 才能命中 callClaude 即将使用的 sessionKey。
   const conversationId = `supervision-${chatId}`
-  clearSession(conversationId, params.workDir, params.profile, params.channelType)
+  clearSession(conversationId, params.workDir, undefined, params.channelType)
 
   const response = await callClaude({
     message: prompt,
     conversationId,
     workDir: params.workDir,
     isGroup: false,
-    profile: params.profile,
+    profile: undefined,
     channel: params.channelType,
   })
 
@@ -437,21 +545,74 @@ function extractTopLevelObjects(text: string): string[] {
   return out
 }
 
+// parse 失败的标记前缀：validateDecision 据此触发重试，避免被当成 LLM 真的判 "无需跟进" 而静默吞掉
+const PARSE_FAIL_REASON_PREFIX = '[parse-failed]'
+
+/**
+ * Best-effort 修复 LLM 写中文 JSON 时常见的「内嵌半角双引号未转义」错误。
+ * 例：{"message": "请别再回复"催办已生成"了"} → {"message": "请别再回复\"催办已生成\"了"}
+ *
+ * 启发式：扫描每个字符串，遇到内嵌 `"` 时 peek 下一个非空白字符——
+ * - 是 `:` `,` `}` `]` 或 EOF：判定为真正的字符串结束引号，不动
+ * - 否则：视为内嵌引号，替换为 `\"`
+ *
+ * 对中文自然语言场景几乎无误判风险；纯英文/代码片段值里如果合法包含 `,"` 序列可能误识别，
+ * 因此仅在 JSON.parse 失败时作为兜底使用。
+ */
+function tryFixUnescapedQuotes(text: string): string {
+  let result = ''
+  let inString = false
+  let escape = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (escape) { result += c; escape = false; continue }
+    if (c === '\\') { result += c; escape = true; continue }
+    if (!inString) {
+      result += c
+      if (c === '"') inString = true
+      continue
+    }
+    if (c === '"') {
+      // peek 下一个非空白字符
+      let j = i + 1
+      while (j < text.length && /\s/.test(text[j])) j++
+      const next = j < text.length ? text[j] : ''
+      if (next === ':' || next === ',' || next === '}' || next === ']' || next === '') {
+        result += c          // 真正的字符串结束引号
+        inString = false
+      } else {
+        result += '\\"'      // 内嵌引号，转义
+      }
+      continue
+    }
+    result += c
+  }
+  return result
+}
+
+function tryParseOne(candidate: string): FollowUpDecision | null {
+  try { return JSON.parse(candidate) as FollowUpDecision } catch { /* try fixer */ }
+  try {
+    const fixed = tryFixUnescapedQuotes(candidate)
+    if (fixed !== candidate) return JSON.parse(fixed) as FollowUpDecision
+  } catch { /* fixer didn't help */ }
+  return null
+}
+
 function parseDecision(text: string): FollowUpDecision {
   // 从后向前找第一个能 JSON.parse 通过的 top-level {...}。
   // 选最后一段而非最长，避免误选 prompt 中的示例 JSON（LLM 偶尔会先 echo 示例再吐真实结果）。
   const candidates = extractTopLevelObjects(text)
+  // 截 500 字给 log，长 prompt 不要把日志撑爆
+  const rawSnippet = text.trim().substring(0, 500)
   if (candidates.length === 0) {
-    return { shouldFollowUp: false, reason: 'LLM 返回中找不到 JSON' }
+    return { shouldFollowUp: false, reason: `${PARSE_FAIL_REASON_PREFIX} 返回中找不到 JSON; raw=${rawSnippet}` }
   }
   for (let i = candidates.length - 1; i >= 0; i--) {
-    try {
-      return JSON.parse(candidates[i]) as FollowUpDecision
-    } catch {
-      // 该段无法解析，继续往前找
-    }
+    const parsed = tryParseOne(candidates[i])
+    if (parsed !== null) return parsed
   }
-  return { shouldFollowUp: false, reason: 'LLM 返回中所有 JSON 段都解析失败' }
+  return { shouldFollowUp: false, reason: `${PARSE_FAIL_REASON_PREFIX} 所有 JSON 段都解析失败（含 fixer 兜底）; raw=${rawSnippet}` }
 }
 
 interface ValidationResult {
@@ -459,22 +620,44 @@ interface ValidationResult {
   reason?: string
 }
 
-function validateDecision(decision: FollowUpDecision, botProfiles: string[]): ValidationResult {
+/** 把 decision 序列化进 reason，方便所有 validation 失败时把 LLM 原始输出落盘排查 */
+function withDecision(reason: string, decision: FollowUpDecision): string {
+  let payload: string
+  try { payload = JSON.stringify(decision) }
+  catch { payload = String(decision) }
+  if (payload.length > 800) payload = payload.substring(0, 800) + '...(truncated)'
+  return `${reason}; decision=${payload}`
+}
+
+function validateDecision(decision: FollowUpDecision, botInfos: BotInfo[]): ValidationResult {
+  // 优先识别 parse 失败：当成 validation 失败 → 触发已有的重试链路（区别于 LLM 真的判 "无需跟进"）
+  if (decision.reason?.startsWith(PARSE_FAIL_REASON_PREFIX)) {
+    return { ok: false, reason: decision.reason }  // parse-fail 的 reason 已自带 raw 文本
+  }
   if (decision.shouldFollowUp === false) return { ok: true }
   if (decision.shouldFollowUp !== true) {
-    return { ok: false, reason: 'shouldFollowUp 字段缺失或非布尔' }
+    return { ok: false, reason: withDecision('shouldFollowUp 字段缺失或非布尔', decision) }
   }
   if (!decision.mention || typeof decision.mention !== 'string') {
-    return { ok: false, reason: 'mention 缺失' }
+    return { ok: false, reason: withDecision('mention 缺失', decision) }
   }
-  if (!botProfiles.includes(decision.mention)) {
-    return { ok: false, reason: `mention "${decision.mention}" 不在 agent 列表 [${botProfiles.join(', ')}] 中` }
+  const target = botInfos.find(b => b.profileName === decision.mention)
+  if (!target) {
+    return {
+      ok: false,
+      reason: withDecision(
+        `mention "${decision.mention}" 不在 agent 列表 [${botInfos.map(b => b.profileName).join(', ')}] 中`,
+        decision
+      ),
+    }
   }
   if (!decision.message || typeof decision.message !== 'string') {
-    return { ok: false, reason: 'message 缺失' }
+    return { ok: false, reason: withDecision('message 缺失', decision) }
   }
-  if (!decision.message.includes(`@${decision.mention}`)) {
-    return { ok: false, reason: `message 中缺少字面 @${decision.mention}` }
+  if (!decision.message.trim()) {
+    return { ok: false, reason: withDecision('message 为空字符串', decision) }
   }
+  // 不再校验 <at> 标签 —— 标签由代码在 checkOneChat 内用 channel.formatMention 后置组装。
+  // 这避免了 LLM 把标签写错（单引号、空白、HTML 转义、跨 channel 格式差异）导致的误 drop。
   return { ok: true }
 }

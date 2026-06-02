@@ -15,11 +15,11 @@ import type {
   Channel,
   ChannelMessageContext,
   FeishuChannelConfig,
+  MentionTarget,
   PeerMessage,
 } from '../../types.js';
 import { registerChannel } from '../registry.js';
 import { createLogger } from '../../core/logger.js';
-import { loadConfig } from '../../core/claude.js';
 import {
   loadPeerMessages,
   removePeerMessages,
@@ -258,12 +258,34 @@ export class FeishuClient implements Channel {
 
       // 2. 走 channelMessageHandler 流程（即 Claude CLI 流程）
       if (this.channelMessageHandler) {
+        // peerMsg.from 是发送方 profileName；从 _bot_self 反查到对应 bot 的 openId / displayName，
+        // 让 LLM 拿到与直接消息路径同等量级的上下文（群成员表 + 历史 + sender 信息）。
+        const fromBot = this.getChatMembersFromConfig('_bot_self').find(
+          (b) => b.profileName === peerMsg.from
+        );
+
+        let contextMessage: string | undefined;
+        try {
+          contextMessage = await this.buildContextMessage({
+            conversationId: peerMsg.chatId,
+            isGroup: true,
+            senderOpenId: fromBot?.openId,
+            senderName: fromBot?.name,
+            currentMessageId: peerMsg.messageId,
+            // peer-message 没存 mentions 数组，但 message 正文里有 <at> 标签；LLM 能直接读
+            mentions: undefined,
+            messageText: peerMsg.message,
+          });
+        } catch (error) {
+          this.logger(`Failed to build context message for peer msg ${peerMsg.id}: ${error}`);
+        }
+
         const context: ChannelMessageContext = {
           conversationId: peerMsg.chatId,
           senderId: peerMsg.from,
           isGroup: true,
           userId: peerMsg.from,
-          processedMessage: undefined,
+          processedMessage: contextMessage,
         };
 
         try {
@@ -954,12 +976,19 @@ export class FeishuClient implements Channel {
     }
 
     if (this.channelMessageHandler) {
-      // 飞书群聊默认启用上下文功能（固定 20 条历史消息）
+      // 飞书群聊默认启用上下文功能（固定 6 条历史消息）
       let contextMessage: string | undefined;
       if (isGroup) {
         this.logger(`Group chat detected, building context message...`);
         try {
-          contextMessage = await this.buildContextMessage(event, finalMessageText);
+          contextMessage = await this.buildContextMessage({
+            conversationId,
+            isGroup: true,
+            senderOpenId: event.sender.sender_id?.open_id,
+            currentMessageId: event.message.message_id,
+            mentions: event.message.mentions,
+            messageText: finalMessageText,
+          });
           this.logger(`Context message built successfully`);
         } catch (error) {
           this.logger(`Failed to build context message (event_id=${eventId}): ${error}`);
@@ -1356,33 +1385,48 @@ export class FeishuClient implements Channel {
    * 构建群聊上下文消息
    * 读取模板文件，替换变量后返回完整的上下文字符串
    */
-  private async buildContextMessage(
-    event: FeishuMessageEvent,
+  /**
+   * 构建发给 Claude 的 context message。
+   * 接收 primitives 而非 FeishuMessageEvent，让 peer-message 转发路径也能复用（peer 路径没有 event）。
+   */
+  private async buildContextMessage(input: {
+    conversationId: string
+    isGroup: boolean
+    /** 发送者 open_id；peer-message 是 bot 时也可填 */
+    senderOpenId?: string
+    /** 已知发送者显示名（peer-message 路径可直接传入，免再查；不填则走 chatMembers 反查） */
+    senderName?: string
+    /** 当前消息 ID，用于从历史中过滤掉自己 */
+    currentMessageId?: string
+    /** mentions 数组（直接消息事件有；peer-message 无） */
+    mentions?: Array<{ id?: { open_id?: string }; name?: string }>
     messageText: string
-  ): Promise<string> {
-    const { sender, message } = event;
-    const conversationId = message.chat_id;
+  }): Promise<string> {
+    const { conversationId, isGroup, senderOpenId, senderName, currentMessageId, mentions, messageText } = input;
     const historySize = 6; // 固定 6 条历史消息
 
-    this.logger(`Building context message: conversationId=${conversationId}, sender=${sender.sender_id?.open_id || '(unknown)'}, message="${messageText.substring(0, 100)}..."`);
+    this.logger(`Building context message: conversationId=${conversationId}, sender=${senderOpenId || senderName || '(unknown)'}, message="${messageText.substring(0, 100)}..."`);
 
     // 获取历史消息
     const history = await this.getChatHistory(conversationId, historySize);
 
     // 过滤掉当前消息（历史消息第一条就是当前收到的消息）
-    const filteredHistory = history.filter(msg => msg.messageId !== message.message_id);
+    const filteredHistory = currentMessageId
+      ? history.filter(msg => msg.messageId !== currentMessageId)
+      : history;
 
     // 获取当前消息发送者的用户信息（从群成员配置文件查找）
-    const currentSenderId = sender.sender_id?.open_id || sender.sender_id?.user_id || '(unknown)';
+    const currentSenderId = senderOpenId || '(unknown)';
     const currentSenderMembers = this.getChatMembersFromConfig(conversationId);
-    const currentSenderMember = currentSenderMembers.find(m => m.openId === currentSenderId);
-    const currentSenderName = currentSenderMember?.name || currentSenderId;
-    const senderInfo = `${currentSenderName} (id: ${currentSenderId})`;
-    this.logger(`Current sender: id=${currentSenderId}, name=${currentSenderName}`);
+    const lookupName = senderName
+      || currentSenderMembers.find(m => m.openId === currentSenderId)?.name
+      || currentSenderId;
+    const senderInfo = `${lookupName} (id: ${currentSenderId})`;
+    this.logger(`Current sender: id=${currentSenderId}, name=${lookupName}`);
 
     // 从配置文件读取群成员列表，构建群成员信息段落
     let chatMembersSection = '';
-    if (message.chat_type === 'group') {
+    if (isGroup) {
       const chatMembers = this.getChatMembersFromConfig(conversationId);
       this.logger(`Chat members from config: chatId=${conversationId}, count=${chatMembers.length}`);
 
@@ -1442,7 +1486,7 @@ ${mergedMembers.map((member, index) => {
     const templateContent = fs.readFileSync(templatePath, 'utf-8');
 
     // 构建 mentions 段落
-    const currentMentions = message.mentions || [];
+    const currentMentions = mentions || [];
     this.logger(`Current message mentions: ${currentMentions.length} people`);
     this.logger(`Mentions data: ${JSON.stringify(currentMentions)}`);
     const mentionsSection = currentMentions.length > 0
@@ -1461,7 +1505,7 @@ ${mergedMembers.map((member, index) => {
             atId = mentionOpenId || '(unknown)';
             atIdType = 'open_id';
           }
-          return `  - ${m.name} (at_id: ${atId}, at_id_type: ${atIdType})`;
+          return `  - ${m.name ?? '(unknown)'} (at_id: ${atId}, at_id_type: ${atIdType})`;
         }).join('\n')}`
       : '';
 
@@ -1491,12 +1535,10 @@ ${mergedMembers.map((member, index) => {
 
     this.logger(`Context built: profileName="${this.config.profileName || '(none)'}", historySize=${historySize}, historyCount=${filteredHistory.length}`);
 
-    // subagentEnabled 时 Claude Code 从 agent.md 读取角色信息，无需再注入 profileName 和 systemPrompt
-    const currentConfig = loadConfig(this.config.workDir || process.cwd(), this.config.profileName);
-    const subagentEnabled = currentConfig?.subagentEnabled ?? false;
-    const profileNameValue = subagentEnabled ? '' : (this.config.profileName || '');
-    const systemPromptValue = subagentEnabled ? '' : (this.config.systemPrompt || '');
-    this.logger(`subagentEnabled=${subagentEnabled}, role header=${subagentEnabled ? 'skipped (agent.md)' : 'injected'}`);
+    // profileName / systemPrompt 始终注入到 context 模板，作为消息上下文供 Claude 主循环引用。
+    // 角色身份则通过 --append-system-prompt 在 CLI 层注入到主循环本身的 system prompt（见 claude.ts）。
+    const profileNameValue = this.config.profileName || '';
+    const systemPromptValue = this.config.systemPrompt || '';
 
     // 替换模板变量
     const result = templateContent
@@ -1515,6 +1557,7 @@ ${mergedMembers.map((member, index) => {
   /**
    * 发送消息（实现 Channel 接口）
    * 统一使用 text 类型发送消息，支持 @标签格式
+   * 群消息发送前会自动把 `@profileName` / `@displayName` 纯文本转换为 <at user_id="...">显示名</at>
    * 发送成功后，解析消息中的 @标签，将 peer-message 写入被@机器人的文件
    */
   async sendMessage(
@@ -1522,15 +1565,76 @@ ${mergedMembers.map((member, index) => {
     content: string,
     isGroup: boolean
   ): Promise<void> {
-    const response = await this.sendTextMessage(conversationId, content, isGroup);
+    const finalContent = isGroup ? this.autoConvertPlainAtTags(content) : content;
+    if (finalContent !== content) {
+      this.logger(`[feishu] Auto-converted plain @ to <at> tags before sending to ${conversationId}`);
+    }
+
+    const response = await this.sendTextMessage(conversationId, finalContent, isGroup);
 
     // 发送成功后，解析 @标签，写入 peer-messages
     const messageId = response.data?.message_id;
     if (messageId && isGroup) {
       const chatMembers = this.getChatMembersFromConfig(conversationId);
       const fromProfile = this.config.profileName || 'unknown';
-      writePeerMessagesFromContent(this.claudetalkDir, conversationId, messageId, content, fromProfile, chatMembers);
+      writePeerMessagesFromContent(this.claudetalkDir, conversationId, messageId, finalContent, fromProfile, chatMembers);
     }
+  }
+
+  /**
+   * Channel.formatMention 实现：把 MentionTarget 渲染成飞书 <at> 标签。
+   * - bot 优先用 appId（peer-message.ts:130 路由按 appId 精确匹配）
+   * - 非 bot / 没有 appId 时降级到 openId
+   * - 都没有则 user_id 留空（兜底；至少显示名可见）
+   */
+  formatMention(target: MentionTarget): string {
+    const userId = target.appId || target.openId || '';
+    return `<at user_id="${userId}">${target.displayName}</at>`;
+  }
+
+  /**
+   * 把消息里的纯文本 @profileName / @displayName 兜底转换成 <at user_id="cli_xxx">显示名</at>。
+   * - 仅扫描 `_bot_self` 中已知的 bot（启动时注册过的）
+   * - 已经写成 <at> 形式的不会被重复处理（无 `@` 前缀就跳过）
+   * - 按 (displayName, profileName) 长度倒序匹配，避免短名误吃长名前缀
+   * - `@` 前后要求是非「字母/数字/中文」的字符（或字符串边界），避免误伤邮箱、路径、Markdown
+   * - 复用 formatMention 保证与其他出口的 @ 标签格式完全一致
+   */
+  private autoConvertPlainAtTags(content: string): string {
+    if (!content.includes('@')) return content;
+    const botSelf = this.getChatMembersFromConfig('_bot_self')
+      .filter((b) => b.name && (b.appId || b.openId));
+    if (botSelf.length === 0) return content;
+
+    type Candidate = { keyword: string; tag: string };
+    const candidates: Candidate[] = [];
+    for (const bot of botSelf) {
+      const tag = this.formatMention({
+        profileName: bot.profileName || bot.name,
+        displayName: bot.name,
+        openId: bot.openId,
+        appId: bot.appId,
+      });
+      candidates.push({ keyword: bot.name, tag });
+      if (bot.profileName && bot.profileName !== bot.name) {
+        candidates.push({ keyword: bot.profileName, tag });
+      }
+    }
+    // 长 keyword 先替换，避免 "@back" 把 "@backend" 截断
+    candidates.sort((a, b) => b.keyword.length - a.keyword.length);
+
+    let result = content;
+    for (const { keyword, tag } of candidates) {
+      const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      // 前置边界：行首 或 非「字母/数字/下划线/中文」
+      // 后置边界：行尾 或 非「字母/数字/下划线/中文」
+      const pattern = new RegExp(
+        `(^|[^\\w\\u4e00-\\u9fa5])@${escaped}(?![\\w\\u4e00-\\u9fa5])`,
+        'g'
+      );
+      result = result.replace(pattern, (_m, prefix: string) => `${prefix}${tag}`);
+    }
+    return result;
   }
 
   /**

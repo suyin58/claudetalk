@@ -291,6 +291,20 @@ export interface ChannelMessageContext {
   processedMessage?: string
 }
 
+/** 用于 Channel.formatMention 的统一目标描述（同时携带各 channel 自己用到的 routing id） */
+export interface MentionTarget {
+  /** ClaudeTalk 内部 profile key（必填） */
+  profileName: string
+  /** 群里显示名称（必填） */
+  displayName: string
+  /** 飞书 open_id（用户 / 机器人都有） */
+  openId?: string
+  /** 飞书 app_id（机器人专有，peer-message 路由按此匹配） */
+  appId?: string
+  /** 钉钉 AppKey（机器人专有） */
+  clientId?: string
+}
+
 /** Channel 统一接口，各 Channel 各自完整实现 */
 export interface Channel {
   /** 启动连接 */
@@ -301,6 +315,8 @@ export interface Channel {
   onMessage(handler: (context: ChannelMessageContext, message: string) => Promise<void>): void
   /** 发送消息 */
   sendMessage(conversationId: string, content: string, isGroup: boolean): Promise<void>
+  /** 把 mention 目标渲染成本 channel 的 @ 标签格式（feishu: <at user_id="">name</at>；dingtalk: @profileName） */
+  formatMention(target: MentionTarget): string
   /** 发送上线通知（可选，各 Channel 自行实现） */
   sendOnlineNotification?(userId: string, workDir: string): Promise<void>
   /** 获取历史消息（可选，部分 Channel 支持） */
@@ -386,17 +402,10 @@ export interface ProfileConfig {
   dingtalk?: DingTalkProfileConfig
   /** 飞书配置 */
   feishu?: FeishuProfileConfig
-  /** 角色系统提示词 */
+  /** 角色系统提示词，通过 --append-system-prompt 注入 Claude Code 主循环 */
   systemPrompt?: string
-  /** 是否启用 SubAgent */
-  subagentEnabled?: boolean
-  /** SubAgent 使用的模型 */
-  subagentModel?: string
-  /** SubAgent 权限配置 */
-  subagentPermissions?: {
-    allow?: string[]
-    deny?: string[]
-  }
+  /** 模型 ID（可选；通过 --model 注入到 Claude Code 主循环；不填走 claude CLI 默认） */
+  model?: string
   /** 标记为项目监督者：周期性检查群聊停滞并自动 @ 跟进；同一 workDir 最多 1 个 */
   supervisorRole?: boolean
   /** 监督参数（仅 supervisorRole=true 时生效） */

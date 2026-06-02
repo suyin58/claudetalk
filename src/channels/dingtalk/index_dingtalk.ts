@@ -16,10 +16,10 @@ import type {
   AICardCreateRequest,
   AICardStreamingRequest,
   DingTalkInboundCallback,
+  MentionTarget,
 } from '../../types.js';
 import { registerChannel } from '../registry.js';
 import { createLogger } from '../../core/logger.js';
-import { loadConfig } from '../../core/claude.js';
 import {
   loadPeerMessages,
   removePeerMessages,
@@ -34,6 +34,32 @@ import {
 
 const DINGTALK_API_BASE = 'https://api.dingtalk.com';
 const DINGTALK_STREAM_URL = process.env.DINGTALK_STREAM_URL || 'wss://dingtalk-stream.dingtalk.com/connect';
+
+/**
+ * 从文本中提取第一个 **xxx** 加粗内容作为显示名（角色 systemPrompt 与 agent.md 都遵循该约定）
+ * skipFrontmatter=true 时跳过 markdown frontmatter（--- ... ---）
+ */
+function extractDisplayNameFromText(text: string, skipFrontmatter: boolean): string | null {
+  const lines = text.split('\n');
+  let inFrontmatter = false;
+  let frontmatterEnded = !skipFrontmatter;
+  for (const line of lines) {
+    if (skipFrontmatter && !frontmatterEnded && line.trim() === '---') {
+      inFrontmatter = !inFrontmatter;
+      if (!inFrontmatter) frontmatterEnded = true;
+      continue;
+    }
+    if (inFrontmatter) continue;
+    if (!line.trim()) continue;
+    const boldMatch = line.match(/\*\*([^（*]+)/);
+    if (boldMatch) {
+      return boldMatch[1].trim();
+    }
+    // 第一段没有 **xxx** 就停（避免后面段落里的随机加粗被当成显示名）
+    break;
+  }
+  return null;
+}
 
 // 钉钉 Stream 连接票据响应
 interface DingTalkStreamTicketResponse {
@@ -326,12 +352,10 @@ export class DingTalkClient implements Channel {
       return messageText;
     }
 
-    // subagentEnabled 时 Claude Code 从 agent.md 读取角色信息，无需再注入 profileName 和 systemPrompt
-    const currentConfig = loadConfig(this.config.workDir || process.cwd(), this.profileName);
-    const subagentEnabled = currentConfig?.subagentEnabled ?? false;
-    const profileNameValue = subagentEnabled ? '' : this.profileName;
-    const systemPromptValue = subagentEnabled ? '' : (this.config.systemPrompt || '');
-    this.logger(`subagentEnabled=${subagentEnabled}, role header=${subagentEnabled ? 'skipped (agent.md)' : 'injected'}`);
+    // profileName / systemPrompt 始终注入到 context 模板，作为消息上下文供 Claude 主循环引用。
+    // 角色身份则通过 --append-system-prompt 在 CLI 层注入到主循环本身的 system prompt（见 claude.ts）。
+    const profileNameValue = this.profileName;
+    const systemPromptValue = this.config.systemPrompt || '';
 
     // 构建群成员信息段落（从 bot-registry.json 读取各机器人的真实 chatbotUserId）
     const chatMembersSection = this.buildChatMembersSection();
@@ -726,38 +750,37 @@ export class DingTalkClient implements Channel {
   /**
    * 从 agent.md 的第一个正文行（frontmatter 之后）提取机器人的中文名称
    * 例如："你是一个AI论坛项目的**前端开发工程师（Frontend Engineer）**" → "前端开发工程师"
+   * 优先级：agent.md（兼容老安装）→ config.systemPrompt 第一段 **加粗** 中的显示名 → profileName
    */
   private readAgentDisplayName(profileName: string): string {
     const workDir = this.config.workDir || process.cwd();
+
+    // 1) 兼容老安装：.claude/agents/<profile>.md
     const agentMdPath = path.join(workDir, '.claude', 'agents', `${profileName}.md`);
     try {
-      if (!fs.existsSync(agentMdPath)) return profileName;
-      const content = fs.readFileSync(agentMdPath, 'utf-8');
-      // 跳过 frontmatter（--- ... ---），找第一个非空正文行
-      const lines = content.split('\n');
-      let inFrontmatter = false;
-      let frontmatterEnded = false;
-      for (const line of lines) {
-        if (line.trim() === '---') {
-          if (!frontmatterEnded) {
-            inFrontmatter = !inFrontmatter;
-            if (!inFrontmatter) frontmatterEnded = true;
-            continue;
-          }
-        }
-        if (inFrontmatter) continue;
-        if (!line.trim()) continue;
-        // 提取 **中文名称** 格式的内容
-        const boldMatch = line.match(/\*\*([^（*]+)/);
-        if (boldMatch) {
-          return boldMatch[1].trim();
-        }
-        break;
+      if (fs.existsSync(agentMdPath)) {
+        const content = fs.readFileSync(agentMdPath, 'utf-8');
+        const fromMd = extractDisplayNameFromText(content, /* skipFrontmatter */ true);
+        if (fromMd) return fromMd;
       }
     } catch {
-      // 读取失败则返回 profileName
+      // 读取失败则降级
     }
+
+    // 2) 从当前 profile 的 systemPrompt 解析 **xxx** 加粗名（与 agent_auto_config.json 中的模式一致）
+    const sp = this.config.systemPrompt;
+    if (sp) {
+      const fromPrompt = extractDisplayNameFromText(sp, /* skipFrontmatter */ false);
+      if (fromPrompt) return fromPrompt;
+    }
+
+    // 3) 兜底
     return profileName;
+  }
+
+  /** Channel.formatMention 实现：钉钉用 @profileName 文本格式（其它代码已习惯，sendMessage 会再展开） */
+  formatMention(target: MentionTarget): string {
+    return `@${target.profileName}`;
   }
 
   /**

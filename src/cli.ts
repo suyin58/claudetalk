@@ -126,11 +126,6 @@ function promptMultiLineInput(question: string): Promise<string> {
   })
 }
 
-// 将存储的换行符还原为真实的换行符
-function restoreLineBreaks(text: string): string {
-  return text.replace(new RegExp(LINE_SEPARATOR, 'g'), '\n')
-}
-
 function loadRawConfig(filePath: string): RawConfig | null {
   if (!existsSync(filePath)) return null
   try {
@@ -428,37 +423,7 @@ async function autoSetup(workDir: string, opts: { global?: boolean } = {}): Prom
       systemPrompt = await promptMultiLineInput('请输入自定义 prompt: ')
     }
 
-    // 4.5 询问是否配置 SubAgent
-    console.log('')
-    console.log('🤖 SubAgent 配置（可选）')
-    const enableSubagentInput = await promptInput('是否配置 SubAgent？(Y/n): ')
-    const enableSubagent = enableSubagentInput.toLowerCase() !== 'n'
-
-    let subagentModel: string | undefined
-    if (enableSubagent) {
-      console.log('')
-      console.log('  📦 模型选择（直接回车使用 Claude Code 默认模型）：')
-      console.log('     1. claude-opus-4-5    - 最强推理（较慢，费用高）')
-      console.log('     2. claude-sonnet-4-5  - 均衡性能（推荐）')
-      console.log('     3. claude-haiku-4-5   - 速度最快（费用低）')
-      console.log('     4. 手动输入其他模型名称')
-      const modelChoice = await promptInput('  请输入选项 (1-4，直接回车使用默认): ')
-      switch (modelChoice.trim()) {
-        case '1': subagentModel = 'claude-opus-4-5'; break
-        case '2': subagentModel = 'claude-sonnet-4-5'; break
-        case '3': subagentModel = 'claude-haiku-4-5'; break
-        case '4': {
-          const customModel = await promptInput('  请输入模型名称: ')
-          subagentModel = customModel.trim() || undefined
-          break
-        }
-      }
-
-      // 自动创建 SubAgent 文件（路径按 setup 范围分流）
-      await createSubagentFile(profileName, target.agentsDir, systemPrompt, subagentModel)
-    }
-
-    // 4.6 项目监督者询问（基于 updatedConfig 当前累积状态判断已设监督者）
+    // 4.5 项目监督者询问（基于 updatedConfig 当前累积状态判断已设监督者）
     const supervisorDecision = await promptSupervisorRole(updatedConfig, profileName)
     if (supervisorDecision.conflictsToClear.length > 0) {
       updatedConfig.profiles = clearSupervisorRoleOn(
@@ -467,13 +432,11 @@ async function autoSetup(workDir: string, opts: { global?: boolean } = {}): Prom
       )
     }
 
-    // 4.7 保存配置
+    // 4.6 保存配置
     const profileConfig: ProfileConfig = {
       channel: channelType,
       [channelType]: channelConfig,
       ...(systemPrompt ? { systemPrompt } : {}),
-      ...(enableSubagent ? { subagentEnabled: true } : {}),
-      ...(subagentModel ? { subagentModel } : {}),
       ...(supervisorDecision.enabled ? { supervisorRole: true } : {}),
     }
 
@@ -730,47 +693,14 @@ async function interactiveSetup(
     systemPrompt = systemPromptInput || ''
   }
 
-  // 4. SubAgent 配置
-  console.log('')
-  console.log('🤖 SubAgent 配置（可选）')
-  console.log('   SubAgent 是 Claude Code 的原生角色机制，可以提供更精细的权限控制和模型选择。')
-  const enableSubagentInput = await promptInput('是否配置 SubAgent？(Y/n): ')
-  const enableSubagent = enableSubagentInput.toLowerCase() !== 'n'
-
-  let subagentModel: string | undefined
-  if (enableSubagent) {
-    console.log('')
-    console.log('  📦 模型选择（直接回车使用 Claude Code 默认模型）：')
-    console.log('     1. claude-opus-4-5    - 最强推理（较慢，费用高）')
-    console.log('     2. claude-sonnet-4-5  - 均衡性能（推荐）')
-    console.log('     3. claude-haiku-4-5   - 速度最快（费用低）')
-    console.log('     4. 手动输入其他模型名称')
-    const modelChoice = await promptInput('  请输入选项 (1-4，直接回车使用默认): ')
-    switch (modelChoice.trim()) {
-      case '1': subagentModel = 'claude-opus-4-5'; break
-      case '2': subagentModel = 'claude-sonnet-4-5'; break
-      case '3': subagentModel = 'claude-haiku-4-5'; break
-      case '4': {
-        const customModel = await promptInput('  请输入模型名称: ')
-        subagentModel = customModel.trim() || undefined
-        break
-      }
-    }
-
-    // 自动创建 SubAgent 文件（路径按 setup 范围分流）
-    await createSubagentFile(resolvedProfile, target.agentsDir, systemPrompt, subagentModel)
-  }
-
-  // 5. 项目监督者询问
+  // 4. 项目监督者询问
   const supervisorDecision = await promptSupervisorRole(existingRaw, resolvedProfile)
 
-  // 6. 保存配置
+  // 5. 保存配置
   const profileConfig: ProfileConfig = {
     channel: channelType,
     [channelType]: channelConfig,
     ...(systemPrompt ? { systemPrompt } : {}),
-    ...(enableSubagent ? { subagentEnabled: true } : {}),
-    ...(subagentModel ? { subagentModel } : {}),
     ...(supervisorDecision.enabled ? { supervisorRole: true } : {}),
   }
 
@@ -790,35 +720,6 @@ async function interactiveSetup(
   saveRawConfig(updatedConfig, targetFile)
   console.log('')
   console.log(`✅ 角色 [${resolvedProfile}] 配置已保存到 (${scopeLabel}): ${targetFile}`)
-}
-
-/**
- * 创建 SubAgent 配置文件
- */
-async function createSubagentFile(
-  profileName: string,
-  agentsDir: string,
-  systemPrompt?: string,
-  model?: string
-): Promise<void> {
-  // agentsDir 由 caller 决定：
-  //   本地 setup: {workDir}/.claude/agents
-  //   全局 setup: ~/.claudetalk/agents
-  if (!existsSync(agentsDir)) mkdirSync(agentsDir, { recursive: true })
-
-  const agentFile = join(agentsDir, `${profileName}.md`)
-  const lines: string[] = ['---']
-  lines.push(`name: "${profileName}"`)
-  lines.push(`description: "ClaudeTalk 角色: ${profileName}"`)
-  if (model) lines.push(`model: "${model}"`)
-  lines.push('---')
-  lines.push('')
-  // 将存储的换行符还原为真实的换行符
-  const restoredPrompt = systemPrompt ? restoreLineBreaks(systemPrompt) : `你是 ${profileName} 角色，负责相关工作。`
-  lines.push(restoredPrompt)
-
-  writeFileSync(agentFile, lines.join('\n') + '\n', 'utf-8')
-  console.log(`✅ SubAgent 文件已创建: ${agentFile}`)
 }
 
 // ========== 主流程 ==========
@@ -869,8 +770,7 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
           "DINGTALK_CLIENT_ID": "xxx",
           "DINGTALK_CLIENT_SECRET": "xxx"
         },
-        "systemPrompt": "你是产品经理，负责需求分析",
-        "subagentEnabled": true
+        "systemPrompt": "你是产品经理，负责需求分析"
       },
       "dev": {
         "channel": "feishu",
@@ -878,16 +778,16 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
           "FEISHU_APP_ID": "xxx",
           "FEISHU_APP_SECRET": "xxx"
         },
-        "systemPrompt": "你是全栈工程师，擅长 SQL 编写",
-        "subagentEnabled": true
+        "systemPrompt": "你是全栈工程师，擅长 SQL 编写"
       }
     }
   }
+  systemPrompt 通过 Claude Code 的 --append-system-prompt 注入主循环，
+  机器人本身即扮演该角色，不再使用 SubAgent 调度模式。
 
 配置文件:
   .claudetalk.json                                     当前工作目录（本地）
   ~/.claudetalk/config.json                            全局（用于跨目录复用）
-  ~/.claudetalk/agents/                                全局 SubAgent 文件目录
   ~/.claudetalk/locks/                                 实例锁目录（自动管理）
 `)
     process.exit(0)

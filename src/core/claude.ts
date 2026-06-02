@@ -8,7 +8,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import type { ChannelType, ClaudeTalkConfig } from '../types.js'
 import { createLogger, log } from './logger.js'
-import { getGlobalAgentsDir, resolveConfigPath } from './global-config.js'
+import { resolveConfigPath } from './global-config.js'
 
 // Re-export for index.ts compatibility
 export { createLogger, log } from './logger.js'
@@ -27,17 +27,24 @@ export interface SessionEntry {
   isGroup: boolean
   conversationId: string
   userId: string
-  subagentEnabled: boolean
   channel: ChannelType
   needsCompact?: boolean
+  /** 创建该 session 时的 systemPrompt hash；resume 时不匹配则清除重建 */
+  systemPromptHash?: string
 }
 
 function parseSessionEntry(value: unknown): SessionEntry | null {
   if (value && typeof value === 'object' && 'sessionId' in value) {
-    const entry = value as SessionEntry
+    // 旧版本带 subagentEnabled 字段；保留检测以触发一次性迁移（清除老 session）
+    const legacy = (value as Record<string, unknown>).subagentEnabled !== undefined
+    const entry = value as SessionEntry & { subagentEnabled?: unknown }
     if (!entry.userId) entry.userId = ''
-    if (entry.subagentEnabled === undefined) entry.subagentEnabled = false
     if (!entry.channel) entry.channel = 'dingtalk'
+    // 标记：legacy 字段保留在原对象上，caller 可探测；存盘时由调用方决定要不要剥
+    if (legacy) {
+      ;(entry as { _legacySubagentSession?: boolean })._legacySubagentSession = true
+    }
+    delete entry.subagentEnabled
     return entry
   }
   return null
@@ -68,7 +75,22 @@ function loadSessionMap(workDir: string): Map<string, SessionEntry> {
 function saveSessionMap(workDir: string, sessionMap: Map<string, SessionEntry>): void {
   const sessionFile = getSessionFile(workDir)
   try {
-    const entries = Object.fromEntries(sessionMap)
+    // 剥掉内部追踪字段（如 _legacySubagentSession）和遗留字段（如 subagentEnabled）
+    // 只持久化 SessionEntry 显式定义的字段
+    const entries: Record<string, SessionEntry> = {}
+    for (const [key, entry] of sessionMap) {
+      const clean: SessionEntry = {
+        sessionId: entry.sessionId,
+        lastActiveAt: entry.lastActiveAt,
+        isGroup: entry.isGroup,
+        conversationId: entry.conversationId,
+        userId: entry.userId,
+        channel: entry.channel,
+      }
+      if (entry.needsCompact !== undefined) clean.needsCompact = entry.needsCompact
+      if (entry.systemPromptHash !== undefined) clean.systemPromptHash = entry.systemPromptHash
+      entries[key] = clean
+    }
     writeFileSync(sessionFile, JSON.stringify(entries, null, 2) + '\n', 'utf-8')
   } catch (error) {
     log(`[session] Failed to save sessions: ${error}`)
@@ -151,6 +173,13 @@ export function findLastActivePrivateSession(
 
 // ========== 配置加载 ==========
 
+// 与 cli.ts 的 LINE_SEPARATOR 对齐：systemPrompt 在 setup 时把 \n 替换成 U+2028 存盘，
+// 加载时统一在 loadConfig 还原，避免下游（--append-system-prompt / 模板）拿到塌缩成一行的 prompt
+const LINE_SEPARATOR = ' '
+function restoreLineBreaks(text: string): string {
+  return text.replace(new RegExp(LINE_SEPARATOR, 'g'), '\n')
+}
+
 function loadConfigFromFile(filePath: string, profile?: string): ClaudeTalkConfig | null {
   if (!existsSync(filePath)) {
     return null
@@ -164,11 +193,15 @@ function loadConfigFromFile(filePath: string, profile?: string): ClaudeTalkConfi
     }
 
     const profileOverride = profile ? (raw.profiles?.[profile] ?? {}) : {}
-    return {
+    const merged: ClaudeTalkConfig = {
       ...raw,
       ...profileOverride,
       profiles: undefined,
     }
+    if (typeof merged.systemPrompt === 'string') {
+      merged.systemPrompt = restoreLineBreaks(merged.systemPrompt)
+    }
+    return merged
   } catch {
     return null
   }
@@ -180,116 +213,17 @@ export function loadConfig(workDir: string, profile?: string): ClaudeTalkConfig 
   return loadConfigFromFile(resolved.path, profile)
 }
 
-// ========== SubAgent 构建 ==========
+// SubAgent 调度模式已废弃。
+// 现在 Claude Code 主循环本身就是角色：systemPrompt 通过 --append-system-prompt 注入。
+// 旧的 buildAgentJson / parseAgentMdFile 已删除。
 
-/**
- * 解析 .claude/agents/{profileName}.md 文件
- * 格式：YAML frontmatter（---包裹）+ 正文（即 prompt 内容）
- * 返回从文件中提取的 agent 定义字段，优先级高于 .claudetalk.json 中的配置
- */
-function parseAgentMdFile(workDir: string, profileName: string): {
-  description?: string
-  prompt?: string
-  model?: string
-  tools?: string[]
-  disallowedTools?: string[]
-} | null {
-  // 查找顺序：本地 {workDir}/.claude/agents/ → 全局 ~/.claudetalk/agents/
-  const localAgentPath = join(workDir, '.claude', 'agents', `${profileName}.md`)
-  const globalAgentPath = join(getGlobalAgentsDir(), `${profileName}.md`)
-  const agentFilePath = existsSync(localAgentPath)
-    ? localAgentPath
-    : existsSync(globalAgentPath)
-    ? globalAgentPath
-    : null
-  if (!agentFilePath) {
-    return null
+/** 哈希 systemPrompt，用于 session 漂移检测；改用简单的 djb2，避免引入 crypto 依赖 */
+function hashSystemPrompt(text: string): string {
+  let hash = 5381
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0  // hash * 33 + c
   }
-
-  try {
-    const content = readFileSync(agentFilePath, 'utf-8')
-    const result: {
-      description?: string
-      prompt?: string
-      model?: string
-      tools?: string[]
-      disallowedTools?: string[]
-    } = {}
-
-    // 解析 YAML frontmatter（--- 包裹的部分）
-    const frontmatterMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
-    if (frontmatterMatch) {
-      const yamlSection = frontmatterMatch[1]
-      const bodySection = frontmatterMatch[2].trim()
-
-      // 简单解析 YAML 字段（不引入外部依赖）
-      for (const line of yamlSection.split('\n')) {
-        const colonIndex = line.indexOf(':')
-        if (colonIndex === -1) continue
-        const key = line.slice(0, colonIndex).trim()
-        const value = line.slice(colonIndex + 1).trim().replace(/^["']|["']$/g, '')
-
-        if (key === 'description') result.description = value
-        if (key === 'model') result.model = value
-        if (key === 'tools') {
-          // 支持 tools: [Read, Write] 或 tools: Read, Write 格式
-          result.tools = value.replace(/[\[\]]/g, '').split(',').map(t => t.trim()).filter(Boolean)
-        }
-        if (key === 'disallowedTools') {
-          result.disallowedTools = value.replace(/[\[\]]/g, '').split(',').map(t => t.trim()).filter(Boolean)
-        }
-      }
-
-      // 正文作为 prompt
-      if (bodySection) {
-        result.prompt = bodySection
-      }
-    } else {
-      // 没有 frontmatter，整个文件内容作为 prompt
-      result.prompt = content.trim()
-    }
-
-    log(`[agent-md] Loaded agent definition from ${agentFilePath}`)
-    return result
-  } catch (error) {
-    log(`[agent-md] Failed to parse ${agentFilePath}: ${error}`)
-    return null
-  }
-}
-
-/**
- * 构建 --agents 参数的 JSON 字符串
- * 优先级：.claude/agents/{profileName}.md > .claudetalk.json 中的 systemPrompt 配置
- */
-function buildAgentJson(profileName: string, config: ClaudeTalkConfig, workDir: string): string | null {
-  // 优先读取 .claude/agents/{profileName}.md
-  const agentMd = parseAgentMdFile(workDir, profileName)
-
-  const agentDef: Record<string, unknown> = agentMd
-    ? {
-        // 使用 agent.md 中的字段
-        description: agentMd.description || `${profileName} 角色助手`,
-        prompt: agentMd.prompt || `你是 ${profileName} 角色，负责相关工作。`,
-        ...(agentMd.model ? { model: agentMd.model } : {}),
-        ...(agentMd.tools?.length ? { tools: agentMd.tools } : {}),
-        ...(agentMd.disallowedTools?.length ? { disallowedTools: agentMd.disallowedTools } : {}),
-      }
-    : {
-        // 降级：使用 .claudetalk.json 中的 systemPrompt 配置
-        description: config.systemPrompt
-          ? `${profileName} 角色助手。${config.systemPrompt}`
-          : `${profileName} 角色助手，负责相关工作。`,
-        prompt: config.systemPrompt || `你是 ${profileName} 角色，负责相关工作。`,
-        ...(config.subagentModel ? { model: config.subagentModel } : {}),
-        ...(config.subagentPermissions?.allow?.length ? { tools: config.subagentPermissions.allow } : {}),
-        ...(config.subagentPermissions?.deny?.length ? { disallowedTools: config.subagentPermissions.deny } : {}),
-      }
-
-  try {
-    return JSON.stringify({ [profileName]: agentDef })
-  } catch {
-    return null
-  }
+  return (hash >>> 0).toString(16)
 }
 
 // ========== Claude CLI 调用 ==========
@@ -421,9 +355,9 @@ async function compactSession(
  * 调用 claude -p CLI 处理消息，支持多轮会话
  *
  * 新建 session 策略：
- * - 有 profile 且启用 SubAgent → 通过 --agents 传入 SubAgent 定义
- * - 有 profile 但未启用 SubAgent → 通过 --append-system-prompt 传入角色信息
- * - 无 profile → 不传额外参数，Claude 自动委托
+ * - 有 profile 且配了 systemPrompt → 通过 --append-system-prompt 注入角色，主循环本身就是该角色
+ * - 配了 model → 通过 --model 注入到主循环
+ * - resume session 时若 systemPrompt 已变更（hash 不一致）或检测到旧版 subagent session 残留，自动清除重建
  */
 export async function callClaude(options: CallClaudeOptions): Promise<string> {
   // 串行化同一 session 的入站消息，避免并发 spawn `claude --resume` 互相覆盖历史
@@ -472,42 +406,45 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
   const existingSessionId = existingEntry?.sessionId
 
   const currentConfig = loadConfig(workDir, profile)
-  const currentSubagentEnabled = currentConfig?.subagentEnabled ?? false
   const currentSystemPrompt = currentConfig?.systemPrompt
+  const currentSystemPromptHash = currentSystemPrompt ? hashSystemPrompt(currentSystemPrompt) : undefined
+  const currentModel = currentConfig?.model
 
   const args = ['-p', '--output-format', 'json', '--dangerously-skip-permissions']
 
+  // resume 前的两道清除：(1) 旧版本 subagent 模式留下的 session、(2) systemPrompt 已变更的 session
+  // 命中任一则清除 + 重建（递归调用，最多 MAX_SESSION_RETRY_COUNT 次）
   if (existingSessionId && existingEntry) {
-    // 配置变化时清除旧 session，重建（最多重试一次，防止无限递归）
-    if (existingEntry.subagentEnabled !== currentSubagentEnabled) {
+    const isLegacySubagent = (existingEntry as { _legacySubagentSession?: boolean })._legacySubagentSession === true
+    const promptDrifted =
+      existingEntry.systemPromptHash !== undefined &&
+      currentSystemPromptHash !== undefined &&
+      existingEntry.systemPromptHash !== currentSystemPromptHash
+    if (isLegacySubagent || promptDrifted) {
       if (retryCount >= MAX_SESSION_RETRY_COUNT) {
-        throw new Error(`[session] 配置变更后重建 session 失败，已超过最大重试次数 (${MAX_SESSION_RETRY_COUNT})`)
+        throw new Error(`[session] 升级/配置变更后重建 session 失败，已超过最大重试 (${MAX_SESSION_RETRY_COUNT})`)
       }
-      logger(`[session] Config changed: subagentEnabled ${existingEntry.subagentEnabled} -> ${currentSubagentEnabled}, clearing old session`)
+      const reason = isLegacySubagent ? '旧 subagent 模式残留 session' : 'systemPrompt 已变更'
+      logger(`[session] 清除并重建: ${reason} (conversationId=${conversationId})`)
       sessionMap.delete(sessionKey)
       saveSessionMap(workDir, sessionMap)
       return callClaudeImpl(options, retryCount + 1)
     }
-
-    // 恢复 session 时也需要传入 --agents，否则 Claude Code 找不到 SubAgent 定义
-    if (profile && currentSubagentEnabled && currentConfig) {
-      const agentJson = buildAgentJson(profile, currentConfig, workDir)
-      if (agentJson) args.push('--agents', agentJson)
-    }
     args.push('--resume', existingSessionId)
-  } else {
-    if (profile && currentSubagentEnabled && currentConfig) {
-      const agentJson = buildAgentJson(profile, currentConfig, workDir)
-      if (agentJson) args.push('--agents', agentJson)
-    } else if (profile && !currentSubagentEnabled && currentSystemPrompt) {
-      args.push('--append-system-prompt', currentSystemPrompt)
-    }
+  } else if (profile && currentSystemPrompt) {
+    // 新 session：把角色 systemPrompt 注入主循环
+    args.push('--append-system-prompt', currentSystemPrompt)
+  }
+
+  // model 注入仅对新 session 有意义（resume 不能改模型），但加在 resume 上 claude CLI 也会忽略
+  if (currentModel) {
+    args.push('--model', currentModel)
   }
 
   if (existingSessionId) {
     logger(`[claude] Resuming session: conversationId=${conversationId}`)
   } else {
-    logger(`[claude] New session: conversationId=${conversationId}, subagentEnabled=${currentSubagentEnabled}`)
+    logger(`[claude] New session: conversationId=${conversationId}, profile=${profile ?? '(none)'}, model=${currentModel ?? '(default)'}`)
   }
 
   return new Promise((resolve, reject) => {
@@ -524,12 +461,9 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
     child.stdout.on('data', (data: Buffer) => { stdout += data.toString() })
     child.stderr.on('data', (data: Buffer) => { stderr += data.toString() })
 
-    // 优先使用加工后的消息（包含历史消息和角色信息），否则使用原始消息
-    const baseMessage = processedMessage ?? message
-    const actualMessage =
-      profile && currentSubagentEnabled
-        ? `Use the ${profile} agent to handle this: ${baseMessage}`
-        : baseMessage
+    // 优先使用加工后的消息（包含历史消息和角色信息），否则使用原始消息。
+    // 角色身份通过 --append-system-prompt 注入，主循环本身就是该角色，无需再包装 "Use the X agent..."
+    const actualMessage = processedMessage ?? message
 
     // 打印完整 prompt，便于调试
     logger(`[claude] ===== Full Prompt =====`)
@@ -598,8 +532,8 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
             isGroup,
             conversationId,
             userId,
-            subagentEnabled: currentSubagentEnabled,
             channel,
+            systemPromptHash: currentSystemPromptHash,
           })
           saveSessionMap(workDir, sessionMap)
         }
@@ -619,10 +553,6 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
           logger(`[compact] input_tokens (${inputTokens}) exceeded threshold (${AUTO_COMPACT_TOKEN_THRESHOLD}), triggering async compact`)
           // 构建压缩用的 args（复用当前 args，但确保含 --resume）
           const compactArgs = ['-p', '--output-format', 'json', '--dangerously-skip-permissions', '--resume', response.session_id]
-          if (profile && currentSubagentEnabled && currentConfig) {
-            const agentJson = buildAgentJson(profile, currentConfig, workDir)
-            if (agentJson) compactArgs.splice(1, 0, '--agents', agentJson)
-          }
           const compactPromise = compactSession(sessionKey, response.session_id, workDir, profile, compactArgs)
             .finally(() => {
               compactingPromises.delete(sessionKey)
