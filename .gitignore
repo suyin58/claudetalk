@@ -4,3 +4,8 @@
 node_modules/
 dist/
 .claude/
+
+# ClaudeTalk 运行时数据（pid 文件 / 群成员 / peer-message 队列 / 飞书图片缓存）
+.claudetalk/
+.claudetalk.json
+.claudetalk-sessions.json
