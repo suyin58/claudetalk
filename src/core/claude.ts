@@ -270,8 +270,15 @@ export interface CallClaudeOptions {
 
 const MAX_SESSION_RETRY_COUNT = 2
 
-// 自动压缩的 input token 阈值，超过此值时在响应后异步触发 /compact
-const AUTO_COMPACT_TOKEN_THRESHOLD = 200_000
+// 这一轮调用让模型实际消化的 token 总量阈值（input + cache_creation + cache_read）。
+// 超过即认为 session 已显著增长，异步触发 /compact 压缩历史。
+//
+// 注：旧实现只看 usage.input_tokens，但 Claude Code 中 usage.input_tokens 仅统计"非缓存"
+// 的新增 input；长跑 agent 几乎所有上下文都走 cache_read，input_tokens 永远是个位数 ——
+// 导致 200K 阈值永远不达标、压缩从未触发，session 滚到 1M+ 才被模型 400 拒绝。
+// 改成按"这一轮模型实际处理的 token 总量"判断，阈值上调到 1M（模型 200K 窗口的 5 倍），
+// 兼顾"真的该压缩了"与"不要每次都压缩"。
+const AUTO_COMPACT_TOKEN_THRESHOLD = 1_000_000
 
 // 按 sessionKey 存储正在进行的压缩 Promise，用于防止并发操作同一 session
 const compactingPromises = new Map<string, Promise<void>>()
@@ -523,7 +530,9 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
         const modelUsageValues = response.modelUsage ? Object.values(response.modelUsage) : []
         const inputTokens = modelUsageValues.reduce((sum, usage) => sum + (usage.inputTokens ?? 0), 0)
         const cacheReadTokens = modelUsageValues.reduce((sum, usage) => sum + (usage.cacheReadInputTokens ?? 0), 0)
-        logger(`[claude] Done: duration=${response.duration_ms}ms, session_id=${response.session_id}, input_tokens=${inputTokens}, cache_read_tokens=${cacheReadTokens}`)
+        const cacheCreationTokens = modelUsageValues.reduce((sum, usage) => sum + (usage.cacheCreationInputTokens ?? 0), 0)
+        const effectiveContextTokens = inputTokens + cacheReadTokens + cacheCreationTokens
+        logger(`[claude] Done: duration=${response.duration_ms}ms, session_id=${response.session_id}, input_tokens=${inputTokens}, cache_read_tokens=${cacheReadTokens}, cache_creation_tokens=${cacheCreationTokens}, effective_total=${effectiveContextTokens}`)
 
         if (response.session_id) {
           sessionMap.set(sessionKey, {
@@ -548,9 +557,9 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
         // 不能 fallback 到 stdout.trim()，否则会把整个原始 JSON 返回给 IM
         resolve(response.result || '任务执行完成，无需特殊提醒')
 
-        // 响应后检查 token 数量，超过阈值则异步触发压缩
-        if (response.session_id && inputTokens > AUTO_COMPACT_TOKEN_THRESHOLD) {
-          logger(`[compact] input_tokens (${inputTokens}) exceeded threshold (${AUTO_COMPACT_TOKEN_THRESHOLD}), triggering async compact`)
+        // 响应后检查"这一轮实际处理的总 token"，超过阈值则异步触发压缩
+        if (response.session_id && effectiveContextTokens > AUTO_COMPACT_TOKEN_THRESHOLD) {
+          logger(`[compact] effective_total (${effectiveContextTokens}) exceeded threshold (${AUTO_COMPACT_TOKEN_THRESHOLD}), triggering async compact`)
           // 构建压缩用的 args（复用当前 args，但确保含 --resume）
           const compactArgs = ['-p', '--output-format', 'json', '--dangerously-skip-permissions', '--resume', response.session_id]
           const compactPromise = compactSession(sessionKey, response.session_id, workDir, profile, compactArgs)
