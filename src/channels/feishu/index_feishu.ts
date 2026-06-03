@@ -141,8 +141,8 @@ export class FeishuClient implements Channel {
   private readonly claudetalkDir!: string;
   // peer-messages 轮询定时器
   private peerPollTimer: ReturnType<typeof setInterval> | null = null;
-  // 已处理的 peer-message ID 集合（防止重复处理）
-  private processedPeerIds = new Set<string>();
+  // 已处理的 peer-message ID 集合（防止重复处理）ID -> 处理时间戳
+  private processedPeerIds = new Map<string, number>();
   // 机器人的 app_name（从飞书接口获取，用于读取 peer-message 文件）
   private botAppName: string | null = null;
   // 纯图片消息缓存：`${conversationId}:${senderId}` → 待处理的本地图片路径列表
@@ -240,65 +240,102 @@ export class FeishuClient implements Channel {
     const now = Date.now();
     const DELAY_MS = 10 * 1000; // 10秒延迟
 
+    // 只处理未处理过的且已过延迟期的消息
     const pendingMessages = messages.filter(
       (msg: PeerMessage) => !this.processedPeerIds.has(msg.id) && now - msg.createdAt >= DELAY_MS
     );
 
-    if (pendingMessages.length === 0) return;
+    if (pendingMessages.length === 0) {
+      // 即使没有待处理消息，也要清理已处理的消息ID，防止内存泄漏
+      if (this.processedPeerIds.size > 1000) {
+        this.logger(`Cleaning up processedPeerIds cache, size: ${this.processedPeerIds.size}`);
+        // 清理超过1小时的已处理ID
+        const oneHourAgo = now - (60 * 60 * 1000);
+        for (const [id, timestamp] of this.processedPeerIds.entries()) {
+          if (timestamp < oneHourAgo) {
+            this.processedPeerIds.delete(id);
+          }
+        }
+      }
+      return;
+    }
 
     this.logger(`Processing ${pendingMessages.length} peer messages for bot_${botName}.json`);
 
+    // 收集本次处理成功的消息ID，用于删除
+    const successfullyProcessed = new Set<string>();
+
     for (const peerMsg of pendingMessages) {
-      this.processedPeerIds.add(peerMsg.id);
+      try {
+        // 标记为已处理（防止重复处理）
+        this.processedPeerIds.set(peerMsg.id, now);
 
-      // 1. 给原消息回复 Get 表情（收到确认）
-      this.addMessageReaction(peerMsg.messageId, 'Get').catch((error) => {
-        this.logger(`Failed to add reaction to peer message ${peerMsg.messageId}: ${error}`);
-      });
+        // 1. 给原消息回复 Get 表情（收到确认）
+        this.addMessageReaction(peerMsg.messageId, 'Get').catch((error) => {
+          this.logger(`Failed to add reaction to peer message ${peerMsg.messageId}: ${error}`);
+        });
 
-      // 2. 走 channelMessageHandler 流程（即 Claude CLI 流程）
-      if (this.channelMessageHandler) {
-        // peerMsg.from 是发送方 profileName；从 _bot_self 反查到对应 bot 的 openId / displayName，
-        // 让 LLM 拿到与直接消息路径同等量级的上下文（群成员表 + 历史 + sender 信息）。
-        const fromBot = this.getChatMembersFromConfig('_bot_self').find(
-          (b) => b.profileName === peerMsg.from
-        );
+        // 2. 走 channelMessageHandler 流程（即 Claude CLI 流程）
+        if (this.channelMessageHandler) {
+          // peerMsg.from 是发送方 profileName；从 _bot_self 反查到对应 bot 的 openId / displayName，
+          // 让 LLM 拿到与直接消息路径同等量级的上下文（群成员表 + 历史 + sender 信息）。
+          const fromBot = this.getChatMembersFromConfig('_bot_self').find(
+            (b) => b.profileName === peerMsg.from
+          );
 
-        let contextMessage: string | undefined;
-        try {
-          contextMessage = await this.buildContextMessage({
+          let contextMessage: string | undefined;
+          try {
+            contextMessage = await this.buildContextMessage({
+              conversationId: peerMsg.chatId,
+              isGroup: true,
+              senderOpenId: fromBot?.openId,
+              senderName: fromBot?.name,
+              currentMessageId: peerMsg.messageId,
+              // peer-message 没存 mentions 数组，但 message 正文里有 <at> 标签；LLM 能直接读
+              mentions: undefined,
+              messageText: peerMsg.message,
+            });
+          } catch (error) {
+            this.logger(`Failed to build context message for peer msg ${peerMsg.id}: ${error}`);
+          }
+
+          const context: ChannelMessageContext = {
             conversationId: peerMsg.chatId,
+            senderId: peerMsg.from,
             isGroup: true,
-            senderOpenId: fromBot?.openId,
-            senderName: fromBot?.name,
-            currentMessageId: peerMsg.messageId,
-            // peer-message 没存 mentions 数组，但 message 正文里有 <at> 标签；LLM 能直接读
-            mentions: undefined,
-            messageText: peerMsg.message,
-          });
-        } catch (error) {
-          this.logger(`Failed to build context message for peer msg ${peerMsg.id}: ${error}`);
-        }
+            userId: peerMsg.from,
+            processedMessage: contextMessage,
+          };
 
-        const context: ChannelMessageContext = {
-          conversationId: peerMsg.chatId,
-          senderId: peerMsg.from,
-          isGroup: true,
-          userId: peerMsg.from,
-          processedMessage: contextMessage,
-        };
-
-        try {
-          await this.channelMessageHandler(context, peerMsg.message);
-          this.logger(`Peer message processed: id=${peerMsg.id}, from=${peerMsg.from}`);
-        } catch (error) {
-          this.logger(`Failed to process peer message id=${peerMsg.id}: ${error}`);
+          try {
+            await this.channelMessageHandler(context, peerMsg.message);
+            this.logger(`Peer message processed successfully: id=${peerMsg.id}, from=${peerMsg.from}`);
+            // 只有处理成功的才标记为需要删除
+            successfullyProcessed.add(peerMsg.id);
+          } catch (error) {
+            this.logger(`Failed to process peer message id=${peerMsg.id}: ${error}`);
+            // 处理失败的不删除，下次重试
+          }
+        } else {
+          // 没有 channelMessageHandler 也算处理成功，避免消息堆积
+          this.logger(`No channelMessageHandler, marking peer message as processed: id=${peerMsg.id}`);
+          successfullyProcessed.add(peerMsg.id);
         }
+      } catch (error) {
+        this.logger(`Error processing peer message ${peerMsg.id}: ${error}`);
+        // 发生异常的不删除，下次重试
       }
     }
 
-    // 原子删除已处理的消息
-    removePeerMessages(this.claudetalkDir, botName, this.processedPeerIds);
+    // 原子删除已成功处理的消息（只删除本次处理成功的）
+    if (successfullyProcessed.size > 0) {
+      try {
+        removePeerMessages(this.claudetalkDir, botName, successfullyProcessed);
+        this.logger(`Removed ${successfullyProcessed.size} successfully processed messages from bot_${botName}.json`);
+      } catch (error) {
+        this.logger(`Failed to remove processed messages from bot_${botName}.json: ${error}`);
+      }
+    }
   }
 
   /**
