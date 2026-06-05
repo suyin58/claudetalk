@@ -216,11 +216,17 @@ async function checkOneChat(
       return
     }
     const last = recent[recent.length - 1]
-    if (last.senderProfile === params.profile) {
-      logger(`[${chatId}] 最后一条是项目经理自己发的，跳过`)
-      return
-    }
     const idle = now - last.timestamp
+
+    if (last.senderProfile === params.profile) {
+      // 如果停滞超过1小时，即使是自己发的也尝试推进（防止at错误导致长时间卡住）
+      const STUCK_THRESHOLD = 60 * 60 * 1000 // 1小时极度停滞
+      if (idle < STUCK_THRESHOLD) {
+        logger(`[${chatId}] 最后一条是项目经理自己发的，跳过`)
+        return
+      }
+      logger(`[${chatId}] 最后一条是项目经理自己发的，但已停滞 ${Math.round(idle/3600000)} 小时，强制介入`)
+    }
     if (idle < settings.staleThresholdMs) {
       logger(`[${chatId}] 仅停滞 ${Math.round(idle / 60000)} 分钟，未达阈值，跳过`)
       return
