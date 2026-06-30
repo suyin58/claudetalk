@@ -5,7 +5,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs'
-import { join, dirname } from 'path'
+import { join, dirname, basename } from 'path'
 import { fileURLToPath } from 'url'
 import { createInterface } from 'readline'
 import { getAllChannelDescriptors, getChannelDescriptor } from './channels/index.js'
@@ -23,6 +23,12 @@ import {
 // 解析 --global 标志（用于 setup 系列命令）
 function hasGlobalFlag(): boolean {
   return process.argv.includes('--global')
+}
+
+// 根据启动二进制名称决定默认引擎：qodertalk → qodercli，其他 → claude
+function getDefaultEngine(): string {
+  const binName = basename(process.argv[1] ?? '')
+  return binName === 'qodertalk' ? 'qodercli' : 'claude'
 }
 
 // 根据 --global 决定本次 setup 写入的目标路径与 agents 目录
@@ -927,7 +933,7 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
     console.log(`🎭 角色: ${profile}`)
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
     console.log('')
-    await startBot({ workDir, profile })
+    await startBot({ workDir, profile, engine: getDefaultEngine() })
     return
   }
 
@@ -964,7 +970,7 @@ ClaudeTalk - 通过钉钉/飞书机器人与 Claude Code 对话
   const startPromises = profileNames.map((profileName, index) =>
     new Promise<void>((resolve) => {
       setTimeout(() => {
-        startBot({ workDir, profile: profileName })
+        startBot({ workDir, profile: profileName, engine: getDefaultEngine() })
           .catch((error) => {
             console.error(`❌ [${profileName}] 启动失败: ${error instanceof Error ? error.message : String(error)}`)
           })

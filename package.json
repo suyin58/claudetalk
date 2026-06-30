@@ -6,7 +6,8 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "claudetalk": "dist/cli.js"
+    "claudetalk": "dist/cli.js",
+    "qodertalk": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc && npx shx mkdir -p dist/template && npx shx cp src/template/context-message.template dist/template/ && npx shx cp src/template/CLAUDE.md dist/template/ && npx shx cp src/template/agent_auto_config.json dist/template/",

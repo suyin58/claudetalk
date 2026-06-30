@@ -226,6 +226,20 @@ function hashSystemPrompt(text: string): string {
   return (hash >>> 0).toString(16)
 }
 
+// ========== 引擎配置 ==========
+
+interface EngineConfig {
+  command: string
+  skipPermissionsFlag: string[]
+}
+
+function getEngineConfig(engine?: string): EngineConfig {
+  if (engine === 'qodercli') {
+    return { command: 'qodercli', skipPermissionsFlag: ['--yolo'] }
+  }
+  return { command: 'claude', skipPermissionsFlag: ['--dangerously-skip-permissions'] }
+}
+
 // ========== Claude CLI 调用 ==========
 
 interface ClaudeUsage {
@@ -264,6 +278,8 @@ export interface CallClaudeOptions {
   userId?: string
   profile?: string
   channel?: ChannelType
+  /** 执行引擎：claude（默认）或 qodercli */
+  engine?: string
   /** 加工后的消息（由 Channel 处理后生成），有值时替换原始 message 发送给 Claude */
   processedMessage?: string
 }
@@ -296,7 +312,8 @@ async function compactSession(
   sessionId: string,
   workDir: string,
   profile: string | undefined,
-  baseArgs: string[]
+  baseArgs: string[],
+  engineConfig: EngineConfig
 ): Promise<void> {
   const logger = createLogger(profile)
   logger(`[compact] Starting auto compact for session: ${sessionId}`)
@@ -304,7 +321,7 @@ async function compactSession(
   return new Promise<void>((resolve) => {
     // 复用相同的 args（含 --resume），发送 /compact 命令
     const compactArgs = [...baseArgs]
-    const child = spawn('claude', compactArgs, {
+    const child = spawn(engineConfig.command, compactArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: workDir,
       env: { ...process.env },
@@ -395,10 +412,12 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
     userId = '',
     profile,
     channel = 'dingtalk',
+    engine,
     processedMessage,
   } = options
 
   const logger = createLogger(profile)
+  const engineConfig = getEngineConfig(engine)
   const sessionMap = getSessionMap(workDir)
   const sessionKey = getSessionKey(conversationId, workDir, profile, channel)
 
@@ -417,7 +436,7 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
   const currentSystemPromptHash = currentSystemPrompt ? hashSystemPrompt(currentSystemPrompt) : undefined
   const currentModel = currentConfig?.model
 
-  const args = ['-p', '--output-format', 'json', '--dangerously-skip-permissions']
+  const args = ['-p', '--output-format', 'json', ...engineConfig.skipPermissionsFlag]
 
   // resume 前的两道清除：(1) 旧版本 subagent 模式留下的 session、(2) systemPrompt 已变更的 session
   // 命中任一则清除 + 重建（递归调用，最多 MAX_SESSION_RETRY_COUNT 次）
@@ -455,7 +474,7 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn('claude', args, {
+    const child = spawn(engineConfig.command, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: workDir,
       env: { ...process.env },
@@ -474,7 +493,7 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
 
     // 打印完整 prompt，便于调试
     logger(`[claude] ===== Full Prompt =====`)
-    logger(`[claude] args: ${JSON.stringify(args)}`)
+    logger(`[claude] engine: ${engineConfig.command}, args: ${JSON.stringify(args)}`)
     logger(`[claude] prompt (${actualMessage.length} chars):\n${actualMessage}`)
     logger(`[claude] ========================`)
 
@@ -503,16 +522,16 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
         }
 
         if (stderr.includes('Permission denied') || stderr.includes('EACCES')) {
-          reject(new Error(`Claude CLI 权限错误: ${stderr}`))
+          reject(new Error(`${engineConfig.command} CLI 权限错误: ${stderr}`))
           return
         }
 
         if (stderr.includes('command not found') || stderr.includes('ENOENT')) {
-          reject(new Error(`Claude CLI 未找到，请确认已安装: ${stderr}`))
+          reject(new Error(`${engineConfig.command} CLI 未找到，请确认已安装: ${stderr}`))
           return
         }
 
-        reject(new Error(`claude exited with code ${code}. stderr: ${stderr || '(empty)'}, stdout: ${stdout || '(empty)'}`))
+        reject(new Error(`${engineConfig.command} exited with code ${code}. stderr: ${stderr || '(empty)'}, stdout: ${stdout || '(empty)'}`))
         return
       }
 
@@ -561,8 +580,8 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
         if (response.session_id && effectiveContextTokens > AUTO_COMPACT_TOKEN_THRESHOLD) {
           logger(`[compact] effective_total (${effectiveContextTokens}) exceeded threshold (${AUTO_COMPACT_TOKEN_THRESHOLD}), triggering async compact`)
           // 构建压缩用的 args（复用当前 args，但确保含 --resume）
-          const compactArgs = ['-p', '--output-format', 'json', '--dangerously-skip-permissions', '--resume', response.session_id]
-          const compactPromise = compactSession(sessionKey, response.session_id, workDir, profile, compactArgs)
+          const compactArgs = ['-p', '--output-format', 'json', ...engineConfig.skipPermissionsFlag, '--resume', response.session_id]
+          const compactPromise = compactSession(sessionKey, response.session_id, workDir, profile, compactArgs, engineConfig)
             .finally(() => {
               compactingPromises.delete(sessionKey)
             })

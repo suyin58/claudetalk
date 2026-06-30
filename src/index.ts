@@ -15,6 +15,8 @@ import type { Channel, ChannelMessageContext, ClaudeTalkConfig, SupervisionConfi
 export interface StartBotOptions {
   workDir: string
   profile?: string
+  /** 执行引擎：claude 或 qodercli，由启动时的二进制名称决定 */
+  engine?: string
 }
 
 // 内置指令列表
@@ -70,7 +72,7 @@ function createChannel(channelType: string, config: ClaudeTalkConfig, workDir: s
  * 启动 Bot
  */
 export async function startBot(options: StartBotOptions): Promise<void> {
-  const { workDir, profile } = options
+  const { workDir, profile, engine } = options
 
   // 初始化日志文件
   initLogFile(workDir)
@@ -247,6 +249,7 @@ export async function startBot(options: StartBotOptions): Promise<void> {
         userId: context.userId,
         profile,
         channel: channelType,
+        engine,
         processedMessage: context.processedMessage,
       })
       logger(`[onMessage] Claude reply (first 200 chars): "${replyText.substring(0, 200)}"`)
@@ -284,6 +287,7 @@ export async function startBot(options: StartBotOptions): Promise<void> {
         channel,
         channelConfig,
         config: supervisionConfig,
+        engine,
       })
     }
   }
