@@ -18,6 +18,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/ws": "^8.18.1",
     "shx": "^0.4.0",
     "typescript": "^5.0.0"
   },
@@ -39,7 +40,8 @@
   ],
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.7.0",
-    "socks-proxy-agent": "^8.0.5"
+    "socks-proxy-agent": "^8.0.5",
+    "ws": "^8.21.0"
   },
   "overrides": {
     "undici": "^7.0.0",

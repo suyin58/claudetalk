@@ -5,6 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { WebSocket } from 'ws';
 import type {
   Channel,
   ChannelMessageContext,
@@ -110,8 +111,8 @@ export class DingTalkClient implements Channel {
   // 注意：钉钉 Stream 连接建立后有约 60 秒的"预热期"，期间不会推送任何帧（包括 ping）
   // 因此超时时间需要设置得比预热期更长，避免误判为断连
   private lastFrameAt: number = 0;
+  private wsAlive: boolean = true;
   private heartbeatWatchdog: ReturnType<typeof setInterval> | null = null;
-  private readonly HEARTBEAT_TIMEOUT_MS = 3 * 60 * 1000; // 3分钟无帧则认为连接已断
 
   constructor(config: DingTalkChannelConfig) {
     this.config = config;
@@ -431,35 +432,35 @@ export class DingTalkClient implements Channel {
       const ws = new WebSocket(wsUrl);
       this.ws = ws;
 
-      ws.onopen = () => {
+      ws.on('open', () => {
         this.logger('DingTalk Stream connected');
         // 重置重连延迟
         this.reconnectDelayMs = 3000;
-        // 注意：钉钉 Stream 连接建立后不会发送任何帧（包括 ping），连接是稳定的
-        // 不启动 watchdog，避免误杀健康连接；依赖 ws.onerror 和 ws.onclose 处理真正的断连
+        this.lastFrameAt = Date.now();
+        // 启动心跳 watchdog：超过 3 分钟无帧则强制重连，避免连接静默死亡后机器人卡死
+        this.startHeartbeatWatchdog(ws);
         resolve();
-      };
+      });
 
-      ws.onmessage = async (event) => {
+      ws.on('message', async (data: Buffer) => {
         // 每次收到帧都更新时间戳（包括心跳 ping）
         this.lastFrameAt = Date.now();
         try {
-          const frame = JSON.parse(event.data as string) as DingTalkStreamFrame;
+          const frame = JSON.parse(data.toString()) as DingTalkStreamFrame;
           await this.handleStreamFrame(ws, frame);
         } catch (error) {
           this.logger(`Failed to handle stream frame: ${error}`);
         }
-      };
+      });
 
-      ws.onerror = (error) => {
-        this.logger('DingTalk Stream WebSocket error: ' + JSON.stringify(error));
-        this.logger(`[ws.onerror] Error type: ${(error as any)?.type}`);
-        this.logger(`[ws.onerror] Error message: ${(error as any)?.message}`);
-        // 错误不 reject，等待 onclose 处理重连
-      };
+      ws.on('error', (error: Error) => {
+        this.logger('DingTalk Stream WebSocket error: ' + error.message);
+        // 错误不 reject，等待 close 事件处理重连
+      });
 
-      ws.onclose = (event) => {
-        this.logger(`DingTalk Stream disconnected: code=${event.code}, reason=${event.reason}`);
+      ws.on('close', (code: number, reason: Buffer) => {
+        const reasonStr = reason.toString();
+        this.logger(`DingTalk Stream disconnected: code=${code}, reason=${reasonStr}`);
         this.ws = null;
         this.stopHeartbeatWatchdog();
 
@@ -467,65 +468,49 @@ export class DingTalkClient implements Channel {
           // code=1006：异常断连（WebSocket 握手失败、网络中断等），使用指数退避避免雪崩
           // code=1005：服务器正常关闭（如空闲超时），立即重连以减少消息丢失窗口
           // 其他 code：保守起见也使用退避
-          const isAbnormalClose = event.code === 1006;
+          const isAbnormalClose = code === 1006;
           if (isAbnormalClose) {
             this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30000);
-            this.logger(`[ws.onclose] Abnormal close (code=${event.code}), reconnecting in ${this.reconnectDelayMs}ms...`);
+            this.logger(`[ws close] Abnormal close (code=${code}), reconnecting in ${this.reconnectDelayMs}ms...`);
             this.reconnectTimer = setTimeout(() => {
               this.startReconnectLoop();
             }, this.reconnectDelayMs);
           } else {
             // 正常关闭（服务器主动断开），重置退避并立即重连
             this.reconnectDelayMs = 3000;
-            this.logger(`[ws.onclose] Normal close (code=${event.code}), reconnecting immediately...`);
+            this.logger(`[ws close] Normal close (code=${code}), reconnecting immediately...`);
             this.startReconnectLoop();
           }
         }
-      };
+      });
     });
   }
 
   /**
-   * 启动心跳 watchdog：
-   * 1. 每 30 秒主动发送一次 ping 帧，防止钉钉服务器因空闲超时（约 60 秒）断开连接
-   * 2. 如果超过 3 分钟没有收到任何帧，则认为连接已死，主动断开并重连
+   * 心跳 watchdog：使用 WebSocket 协议级 ping/pong 检测死连接
+   * 钉钉服务器会主动发 WebSocket ping，ws 库自动回 pong，连接保持活跃。
+   * 客户端也每 30s 主动 ping，如果上一个 ping 未收到 pong 则认为连接已死。
    */
   private startHeartbeatWatchdog(ws: WebSocket): void {
     this.stopHeartbeatWatchdog();
-    this.heartbeatWatchdog = setInterval(() => {
-      const silentMs = Date.now() - this.lastFrameAt;
+    this.wsAlive = true;
 
-      // 超过 3 分钟无帧，认为连接已死，强制重连
-      if (silentMs > this.HEARTBEAT_TIMEOUT_MS) {
-        this.logger(`[watchdog] No frame received for ${Math.round(silentMs / 1000)}s, forcing reconnect...`);
+    ws.on('pong', () => {
+      this.wsAlive = true;
+    });
+
+    this.heartbeatWatchdog = setInterval(() => {
+      if (!this.wsAlive) {
+        this.logger(`[watchdog] No WebSocket pong since last ping, terminating...`);
         this.stopHeartbeatWatchdog();
-        try {
-          ws.close();
-        } catch {
-          this.ws = null;
-          if (!this.isManuallyClosed) {
-            this.reconnectDelayMs = 3000;
-            this.startReconnectLoop();
-          }
-        }
+        ws.terminate();
         return;
       }
-
-      // 主动发送 ping，防止钉钉服务器空闲超时断开（钉钉空闲超时约 60 秒）
-      if (ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(JSON.stringify({
-            type: 'SYSTEM',
-            headers: {
-              topic: 'ping',
-              messageId: `client-ping-${Date.now()}`,
-              time: String(Date.now()),
-            },
-            data: 'ping',
-          }));
-        } catch (error) {
-          this.logger(`[watchdog] Failed to send ping: ${error}`);
-        }
+      this.wsAlive = false;
+      try {
+        ws.ping();
+      } catch {
+        // socket already closed
       }
     }, 30 * 1000);
   }
@@ -590,7 +575,13 @@ export class DingTalkClient implements Channel {
     if (type === 'SYSTEM') {
       // 系统消息（心跳等）
       if (headers.topic === 'ping') {
-        ws.send(JSON.stringify({ ...ack, data: 'pong' }));
+        // 官方 SDK 格式：原样回传 headers + data（含 opaque），不能构造新 headers
+        ws.send(JSON.stringify({
+          code: 200,
+          headers,
+          message: 'OK',
+          data,
+        }));
       } else {
         ws.send(JSON.stringify(ack));
       }
