@@ -881,12 +881,10 @@ export class DingTalkClient implements Channel {
         this.privateSenderCache.set(callback.conversationId, callback.senderStaffId);
       }
 
-      // 先发送"收到"消息，让用户知道机器人已接收
-      try {
-        await this.sendMessage(callback.conversationId, '👍 收到，正在处理...', isGroup);
-      } catch (error) {
-        this.logger(`Failed to send "received" message: ${error}`);
-      }
+      // 给原消息添加表情回复（类似飞书的 reaction），让用户知道机器人已接收
+      this.addMessageReaction(callback.msgId, callback.conversationId).catch(error => {
+        this.logger(`Failed to add reaction to message ${callback.msgId}: ${error}`);
+      });
 
       const context: ChannelMessageContext = {
         conversationId: callback.conversationId,
@@ -954,6 +952,44 @@ export class DingTalkClient implements Channel {
         );
       }
     }
+  }
+
+  /**
+   * 给消息添加表情回复（emotion reaction）
+   * 使用钉钉 emotion API，在原消息上添加一个表情标记，类似飞书的 reaction。
+   */
+  async addMessageReaction(msgId: string, conversationId: string): Promise<void> {
+    const accessToken = await this.getAccessToken();
+    const robotCode = this.config.robotCode || this.config.clientId;
+
+    const response = await fetch(
+      `${DINGTALK_API_BASE}/v1.0/robot/emotion/reply`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-acs-dingtalk-access-token': accessToken,
+        },
+        body: JSON.stringify({
+          robotCode,
+          openMsgId: msgId,
+          openConversationId: conversationId,
+          emotionType: 2,
+          textEmotion: {
+            emotionId: '2659900',
+            emotionName: '🤔',
+            text: '🤔',
+            backgroundId: 'im_bg_1',
+          },
+        }),
+      }
+    );
+
+    const data = await response.json();
+    if (!response.ok || data.errcode) {
+      throw new Error(`emotion reply failed: ${JSON.stringify(data)}`);
+    }
+    this.logger(`Added reaction 🤔 to message ${msgId}`);
   }
 
   /**
