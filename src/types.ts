@@ -127,11 +127,23 @@ export interface DingTalkInboundCallback {
   /** 文本消息内容 */
   text?: {
     content: string;
+    /** 是否是嵌套回复（引用回复） */
+    isReplyMsg?: boolean;
+    /** 被引用的原始消息 */
+    repliedMsg?: {
+      createdAt: number;
+      senderId: string;
+      msgType: string;
+      msgId: string;
+      content: { text: string } | string;
+    };
   };
   /** 会话 ID */
   conversationId: string;
   /** 发送者 ID */
   senderId: string;
+  /** 发送者昵称（钉钉回调中自带） */
+  senderNick?: string;
   /** 发送者企业员工 ID */
   senderCorpId?: string;
   /** 发送者员工 ID */
@@ -283,12 +295,20 @@ export interface ChannelMessageContext {
   conversationId: string
   /** 发送者 ID */
   senderId: string
+  /** 对话线程所有者 ID（群聊中决定 session 归属；嵌套回复时可能 != senderId） */
+  sessionOwnerId?: string
   /** 是否群聊 */
   isGroup: boolean
   /** 用于私聊通知的用户标识（钉钉 staffId / 飞书 open_id） */
   userId: string
   /** 加工后的消息（由 Channel 处理后生成，用于传给大模型；原始消息用于 ClaudeTalk 内置指令识别） */
   processedMessage?: string
+  /** 回复上下文（用于在回复消息中显示引用块） */
+  replyTo?: {
+    senderNick?: string
+    senderId: string
+    messageSnippet: string
+  }
 }
 
 /** 用于 Channel.formatMention 的统一目标描述（同时携带各 channel 自己用到的 routing id） */
@@ -314,7 +334,7 @@ export interface Channel {
   /** 注册消息处理器 */
   onMessage(handler: (context: ChannelMessageContext, message: string) => Promise<void>): void
   /** 发送消息 */
-  sendMessage(conversationId: string, content: string, isGroup: boolean): Promise<void>
+  sendMessage(conversationId: string, content: string, isGroup: boolean, sessionOwnerId?: string, replyTo?: { senderNick?: string; senderId: string; messageSnippet: string }): Promise<void>
   /** 把 mention 目标渲染成本 channel 的 @ 标签格式（feishu: <at user_id="">name</at>；dingtalk: @profileName） */
   formatMention(target: MentionTarget): string
   /** 发送上线通知（可选，各 Channel 自行实现） */

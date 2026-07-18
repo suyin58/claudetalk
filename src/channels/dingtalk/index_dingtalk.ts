@@ -316,13 +316,18 @@ export class DingTalkClient implements Channel {
    *   1. {workDir}/.claudetalk/dingtalk/context-message.template（用户自定义）
    *   2. dist/channels/dingtalk/context-message.template（内置默认）
    */
-  private buildContextMessage(callback: DingTalkInboundCallback, messageText: string): string {
+  private buildContextMessage(
+    callback: DingTalkInboundCallback,
+    messageText: string,
+    sessionOwnerId: string,
+  ): string {
     const conversationId = callback.conversationId;
 
-    // 读取历史记录（最近 6 条，按时间正序）
+    // 读取历史记录，按 sessionOwnerId 过滤：只显示当前会话所有者的消息和机器人对其的回复
     const allHistory = loadChatHistory(this.claudetalkDir, conversationId);
+    const sessionHistory = allHistory.filter(h => h.sessionOwnerId === sessionOwnerId);
     // 过滤掉当前这条消息（刚写入的最后一条），避免重复
-    const historyWithoutCurrent = allHistory.slice(0, -1).slice(-6);
+    const historyWithoutCurrent = sessionHistory.slice(0, -1).slice(-6);
     const historySection = historyWithoutCurrent.length > 0
       ? formatChatHistory(historyWithoutCurrent)
       : '（暂无历史消息）';
@@ -335,6 +340,16 @@ export class DingTalkClient implements Channel {
     const mentionsSection = atUserIds.length > 0
       ? `- **提及了**: ${atUserIds.join(', ')}`
       : '';
+
+    // 构建嵌套回复引用段落
+    let repliedMsgSection = '';
+    if (callback.text?.isReplyMsg && callback.text?.repliedMsg) {
+      const replied = callback.text.repliedMsg;
+      const repliedContent = typeof replied.content === 'object'
+        ? replied.content.text
+        : replied.content;
+      repliedMsgSection = `- **引用消息**: 发送者=${replied.senderId}, 内容=${repliedContent}`;
+    }
 
     // 读取模板文件：优先用户自定义，其次内置默认
     const userTemplatePath = path.join(this.claudetalkDir, 'template', 'context-message.template');
@@ -369,6 +384,7 @@ export class DingTalkClient implements Channel {
       .replace(/\{\{senderInfo\}\}/g, senderInfo)
       .replace(/\{\{messageText\}\}/g, messageText)
       .replace(/\{\{mentionsSection\}\}/g, mentionsSection)
+      .replace(/\{\{repliedMsgSection\}\}/g, repliedMsgSection)
       .replace(/\{\{historySection\}\}/g, historySection)
       .replace(/\{\{chatMembersSection\}\}/g, chatMembersSection);
 
@@ -574,7 +590,7 @@ export class DingTalkClient implements Channel {
    */
   private async handleStreamFrame(ws: WebSocket, frame: DingTalkStreamFrame): Promise<void> {
     const { type, headers, data } = frame;
-    this.logger(`[stream] frame: type=${type}, topic=${headers?.topic}, data=${data?.substring(0, 200)}`);
+    this.logger(`[stream] frame: type=${type}, topic=${headers?.topic}, data=${data?.substring(0, 2000)}`);
 
     // 回复 ACK
     const ack = {
@@ -720,8 +736,8 @@ export class DingTalkClient implements Channel {
       }
     }
 
-    // 更新消息发送者（真实用户）
-    const senderName = callback.senderId;
+    // 更新消息发送者（真实用户）— 优先使用 senderNick 作为显示名
+    const senderName = callback.senderNick || callback.senderId;
     const existingUser = members.find((m) => m.type === 'user' && m.senderId === callback.senderId);
     if (existingUser) {
       if (existingUser.name !== senderName || existingUser.staffId !== callback.senderStaffId) {
@@ -815,6 +831,45 @@ export class DingTalkClient implements Channel {
     return `### 👥 群成员信息（at_id映射表）\n\n${botLines.join('\n')}\n`;
   }
 
+  /**
+   * 获取所有已知机器人的 chatbotUserId 列表（用于判断嵌套回复是否回复的是机器人消息）
+   * chatbotUserId 存储在按会话的条目中，不在 _bot_self 全局条目中
+   */
+  private getAllBotUserIds(): string[] {
+    const config = this.loadChatMembersConfig();
+    const ids: string[] = [];
+    for (const [key, members] of Object.entries(config)) {
+      if (key === '_bot_self') continue;
+      for (const member of members) {
+        if (member.type === 'bot' && member.chatbotUserId) {
+          ids.push(member.chatbotUserId);
+        }
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * 从聊天历史中查找最接近指定时间的 bot 消息，返回其 sessionOwnerId
+   * 用于嵌套回复机器人消息时，确定该消息属于哪个用户的 session
+   */
+  private findSessionOwnerFromHistory(
+    conversationId: string,
+    createdAt: number
+  ): string | null {
+    const history = loadChatHistory(this.claudetalkDir, conversationId);
+    const botMessages = history.filter((h) => h.role === 'bot' && h.sessionOwnerId);
+    if (botMessages.length === 0) {
+      return null;
+    }
+    // 按时间戳找最接近的 bot 消息
+    const closest = botMessages.reduce((best, msg) => {
+      const diff = Math.abs(msg.timestamp - createdAt);
+      return diff < Math.abs(best.timestamp - createdAt) ? msg : best;
+    });
+    return closest.sessionOwnerId || null;
+  }
+
   private async handleInboundMessage(callback: DingTalkInboundCallback): Promise<void> {
     const isGroup = callback.conversationType === '2';
 
@@ -890,6 +945,27 @@ export class DingTalkClient implements Channel {
 
     this.logger(`Received message from senderId=${callback.senderId}, senderStaffId=${callback.senderStaffId || '(empty)'}, conversationId=${callback.conversationId}, isGroup=${isGroup}: ${messageText}`);
 
+    // 群聊：确定 session 归属（对话线程所有者）
+    let sessionOwnerId = callback.senderId;
+    if (isGroup && callback.text?.isReplyMsg && callback.text?.repliedMsg) {
+      const replied = callback.text.repliedMsg;
+      const botUserIds = this.getAllBotUserIds();
+      if (botUserIds.includes(replied.senderId)) {
+        // 回复的是机器人的消息 → 从历史查找机器人当时在谁的 session 中
+        const found = this.findSessionOwnerFromHistory(callback.conversationId, replied.createdAt);
+        if (found) {
+          sessionOwnerId = found;
+          this.logger(`[session] Nested reply to bot message, routing to session owner: ${found}`);
+        } else {
+          this.logger(`[session] Nested reply to bot message but no session owner found, falling back to sender`);
+        }
+      } else {
+        // 回复的是另一个用户的消息 → 加入那个用户的 session
+        sessionOwnerId = replied.senderId;
+        this.logger(`[session] Nested reply to user ${replied.senderId}, routing to their session`);
+      }
+    }
+
     // 群聊消息写入历史记录
     if (isGroup) {
       appendChatHistory(this.claudetalkDir, callback.conversationId, {
@@ -897,6 +973,8 @@ export class DingTalkClient implements Channel {
         role: 'user',
         senderId: callback.senderId,
         content: messageText,
+        msgId: callback.msgId,
+        sessionOwnerId,
       });
     }
 
@@ -906,7 +984,7 @@ export class DingTalkClient implements Channel {
       if (isGroup) {
         this.logger('Group chat detected, building context message...');
         try {
-          contextMessage = this.buildContextMessage(callback, messageText);
+          contextMessage = this.buildContextMessage(callback, messageText, sessionOwnerId);
           this.logger('Context message built successfully');
         } catch (error) {
           this.logger(`Failed to build context message: ${error}`);
@@ -926,9 +1004,15 @@ export class DingTalkClient implements Channel {
       const context: ChannelMessageContext = {
         conversationId: callback.conversationId,
         senderId: callback.senderId,
+        sessionOwnerId,
         isGroup,
         userId: callback.senderStaffId || '',
         processedMessage: contextMessage,
+        replyTo: isGroup ? {
+          senderNick: callback.senderNick,
+          senderId: callback.senderId,
+          messageSnippet: messageText.substring(0, 100),
+        } : undefined,
       };
       await this.channelMessageHandler(context, messageText);
     }
@@ -942,7 +1026,9 @@ export class DingTalkClient implements Channel {
   async sendMessage(
     conversationId: string,
     content: string,
-    isGroup: boolean
+    isGroup: boolean,
+    sessionOwnerId?: string,
+    replyTo?: { senderNick?: string; senderId: string; messageSnippet: string }
   ): Promise<void> {
     const messageType = this.config.messageType || 'markdown';
 
@@ -950,6 +1036,12 @@ export class DingTalkClient implements Channel {
     // 例如：@front → <at id=front>前端开发工程师</at>
     let displayContent = content;
     if (isGroup) {
+      // 在回复内容前添加引用块，显示原消息发送者和内容摘要
+      if (replyTo) {
+        const senderLabel = replyTo.senderNick || replyTo.senderId;
+        displayContent = `> **${senderLabel}**: ${replyTo.messageSnippet}\n\n${displayContent}`;
+      }
+
       const knownProfiles = this.loadKnownProfilesFromChatMembers();
       const chatMembersConfig = this.loadChatMembersConfig();
       const botSelf = chatMembersConfig['_bot_self'] || [];
@@ -976,6 +1068,7 @@ export class DingTalkClient implements Channel {
         role: 'bot',
         senderId: this.profileName,
         content,
+        sessionOwnerId,
       });
 
       const knownProfiles = this.loadKnownProfilesFromChatMembers();
@@ -1104,8 +1197,17 @@ export class DingTalkClient implements Channel {
     const accessToken = await this.getAccessToken();
     const robotCode = this.config.robotCode || this.config.clientId;
     const msgKey = 'sampleMarkdown';
+    // 用回复内容的首行作为消息预览标题，清理 markdown 格式并截取
+    const titleRaw = content
+      .split('\n')
+      .map(l => l.trim())
+      .find(l => l.length > 0) || content;
+    const title = titleRaw
+      .replace(/[*_`~>#\[\]()-]/g, '')
+      .replace(/<at[^>]*>(.*?)<\/at>/g, '$1')
+      .slice(0, 50);
     const msgParam = JSON.stringify({
-      title: 'Claude Code',
+      title,
       text: content,
     });
 

@@ -205,11 +205,12 @@ export async function startBot(options: StartBotOptions): Promise<void> {
 
     // 内置指令：清空会话（使用原始消息判断，不受 processedMessage 影响）
     if (RESET_COMMANDS.has(command)) {
-      const hadSession = clearSession(context.conversationId, workDir, profile, channelType)
+      const sessionSenderId = context.isGroup ? context.sessionOwnerId : undefined
+      const hadSession = clearSession(context.conversationId, workDir, profile, channelType, sessionSenderId)
       const replyText = hadSession
         ? '🔄 已清空当前会话记忆，下次发消息将开启全新对话。'
         : '💡 当前没有活跃的会话记忆，发消息即可开始新对话。'
-      await channel.sendMessage(context.conversationId, replyText, context.isGroup)
+      await channel.sendMessage(context.conversationId, replyText, context.isGroup, sessionSenderId)
       return
     }
 
@@ -241,19 +242,21 @@ export async function startBot(options: StartBotOptions): Promise<void> {
 
     // 调用 Claude Code CLI 处理消息
     try {
+      const sessionSenderId = context.isGroup ? context.sessionOwnerId : undefined
       const replyText = await callClaude({
         message,
         conversationId: context.conversationId,
         workDir,
         isGroup: context.isGroup,
         userId: context.userId,
+        senderId: sessionSenderId,
         profile,
         channel: channelType,
         engine,
         processedMessage: context.processedMessage,
       })
       logger(`[onMessage] Claude reply (first 200 chars): "${replyText.substring(0, 200)}"`)
-      await channel.sendMessage(context.conversationId, replyText, context.isGroup)
+      await channel.sendMessage(context.conversationId, replyText, context.isGroup, sessionSenderId, context.replyTo)
     } catch (error) {
       logger(`[ERROR] ${error}`)
       const errorText = `处理消息时出错: ${error instanceof Error ? error.message : String(error)}`

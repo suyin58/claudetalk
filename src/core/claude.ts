@@ -109,19 +109,22 @@ function getSessionMap(workDir: string): Map<string, SessionEntry> {
 
 /**
  * 生成 session key
- * 格式：conversationId\x00workDir\x00profile\x00channel
+ * 格式：conversationId\x00workDir\x00profile\x00channel[\x00senderId]
  * 使用 \x00（NUL 字符）作为分隔符，避免路径或 ID 中含有 | 导致解析错误
  * 不同 profile、不同 channel 的 session 完全隔离
+ * 群聊中传入 senderId 实现每用户独立 session
  */
 export function getSessionKey(
   conversationId: string,
   workDir: string,
   profile?: string,
-  channel?: ChannelType
+  channel?: ChannelType,
+  senderId?: string
 ): string {
   const parts = [conversationId, workDir]
   if (profile) parts.push(profile)
   if (channel) parts.push(channel)
+  if (senderId) parts.push(senderId)
   return parts.join('\x00')
 }
 
@@ -132,10 +135,11 @@ export function clearSession(
   conversationId: string,
   workDir: string,
   profile?: string,
-  channel?: ChannelType
+  channel?: ChannelType,
+  senderId?: string
 ): boolean {
   const sessionMap = getSessionMap(workDir)
-  const sessionKey = getSessionKey(conversationId, workDir, profile, channel)
+  const sessionKey = getSessionKey(conversationId, workDir, profile, channel, senderId)
   const hadSession = sessionMap.has(sessionKey)
   if (hadSession) {
     sessionMap.delete(sessionKey)
@@ -276,6 +280,8 @@ export interface CallClaudeOptions {
   workDir: string
   isGroup?: boolean
   userId?: string
+  /** 对话线程所有者 ID（群聊中决定 session 归属） */
+  senderId?: string
   profile?: string
   channel?: ChannelType
   /** 执行引擎：claude（默认）或 qodercli */
@@ -386,7 +392,7 @@ async function compactSession(
 export async function callClaude(options: CallClaudeOptions): Promise<string> {
   // 串行化同一 session 的入站消息，避免并发 spawn `claude --resume` 互相覆盖历史
   const channel = options.channel ?? 'dingtalk'
-  const sessionKey = getSessionKey(options.conversationId, options.workDir, options.profile, channel)
+  const sessionKey = getSessionKey(options.conversationId, options.workDir, options.profile, channel, options.senderId)
   const previous = inFlightBySession.get(sessionKey)
   const work = (async () => {
     if (previous) {
@@ -410,6 +416,7 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
     workDir,
     isGroup = false,
     userId = '',
+    senderId,
     profile,
     channel = 'dingtalk',
     engine,
@@ -419,7 +426,7 @@ async function callClaudeImpl(options: CallClaudeOptions, retryCount: number): P
   const logger = createLogger(profile)
   const engineConfig = getEngineConfig(engine)
   const sessionMap = getSessionMap(workDir)
-  const sessionKey = getSessionKey(conversationId, workDir, profile, channel)
+  const sessionKey = getSessionKey(conversationId, workDir, profile, channel, senderId)
 
   // 如果当前 session 正在压缩，等待压缩完成后再处理新消息
   const pendingCompact = compactingPromises.get(sessionKey)

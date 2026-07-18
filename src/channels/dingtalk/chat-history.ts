@@ -33,6 +33,10 @@ export interface ChatHistoryEntry {
   senderId: string;
   /** 消息内容 */
   content: string;
+  /** 消息 ID（用户消息的 msgId，用于精确匹配嵌套回复） */
+  msgId?: string;
+  /** 这条消息所属的 session 所有者 ID（用于嵌套回复路由） */
+  sessionOwnerId?: string;
 }
 
 // ========== 文件路径 ==========
