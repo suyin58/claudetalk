@@ -34,8 +34,8 @@ export interface DingTalkChannelConfig {
   corpId?: string;
   /** 应用 ID */
   agentId?: string;
-  /** 私聊策略: open | pairing | allowlist */
-  dmPolicy?: 'open' | 'pairing' | 'allowlist';
+  /** 私聊策略: open | pairing | allowlist | disabled */
+  dmPolicy?: 'open' | 'pairing' | 'allowlist' | 'disabled';
   /** 群聊策略: open | allowlist | disabled */
   groupPolicy?: 'open' | 'allowlist' | 'disabled';
   /** 允许的发送者 ID 列表 */

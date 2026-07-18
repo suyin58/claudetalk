@@ -112,6 +112,7 @@ export class DingTalkClient implements Channel {
   // 因此超时时间需要设置得比预热期更长，避免误判为断连
   private lastFrameAt: number = 0;
   private wsAlive: boolean = true;
+  private hasReceivedFrame: boolean = false;
   private heartbeatWatchdog: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: DingTalkChannelConfig) {
@@ -445,6 +446,7 @@ export class DingTalkClient implements Channel {
       ws.on('message', async (data: Buffer) => {
         // 每次收到帧都更新时间戳（包括心跳 ping）
         this.lastFrameAt = Date.now();
+        this.hasReceivedFrame = true;
         try {
           const frame = JSON.parse(data.toString()) as DingTalkStreamFrame;
           await this.handleStreamFrame(ws, frame);
@@ -487,21 +489,35 @@ export class DingTalkClient implements Channel {
   }
 
   /**
-   * 心跳 watchdog：使用 WebSocket 协议级 ping/pong 检测死连接
-   * 钉钉服务器会主动发 WebSocket ping，ws 库自动回 pong，连接保持活跃。
-   * 客户端也每 30s 主动 ping，如果上一个 ping 未收到 pong 则认为连接已死。
+   * 心跳 watchdog：双层检测
+   * 1. WebSocket 协议级 ping/pong：每 30s 检测连接是否存活
+   * 2. 帧级别活跃检测：
+   *    - 首帧未到时：等待 15 分钟（钉钉服务端重启后需要 5-10 分钟才开始投递）
+   *    - 首帧已到后：5 分钟无帧则重连（检测静默停止投递）
    */
   private startHeartbeatWatchdog(ws: WebSocket): void {
     this.stopHeartbeatWatchdog();
     this.wsAlive = true;
+    this.hasReceivedFrame = false;
 
     ws.on('pong', () => {
       this.wsAlive = true;
     });
 
     this.heartbeatWatchdog = setInterval(() => {
+      // 检查 1：WebSocket 协议级 pong
       if (!this.wsAlive) {
         this.logger(`[watchdog] No WebSocket pong since last ping, terminating...`);
+        this.stopHeartbeatWatchdog();
+        ws.terminate();
+        return;
+      }
+      // 检查 2：帧级别活跃度
+      const frameIdleMs = Date.now() - this.lastFrameAt;
+      const threshold = this.hasReceivedFrame ? 5 * 60 * 1000 : 15 * 60 * 1000;
+      if (frameIdleMs > threshold) {
+        const label = this.hasReceivedFrame ? 'no frame since last activity' : 'no first frame yet (grace period exceeded)';
+        this.logger(`[watchdog] No frame received for ${Math.round(frameIdleMs / 1000)}s (${label}), forcing reconnect...`);
         this.stopHeartbeatWatchdog();
         ws.terminate();
         return;
@@ -822,6 +838,18 @@ export class DingTalkClient implements Channel {
     } else {
       // 私聊策略检查
       const dmPolicy = this.config.dmPolicy || 'open';
+      if (dmPolicy === 'disabled') {
+        this.logger('Direct message is disabled, replying with hint');
+        const userId = callback.senderStaffId || callback.senderId;
+        this.logger(`[debug] DM hint: senderId=${callback.senderId}, senderStaffId=${callback.senderStaffId || '(empty)'}, using userId=${userId}`);
+        try {
+          const result = await this.sendPrivateMessage(userId, '该机器人仅在群聊中可用，请在群内 @我 进行对话。');
+          this.logger(`[debug] DM hint send result: ${JSON.stringify(result)}`);
+        } catch (error) {
+          this.logger(`Failed to send DM disabled hint: ${error}`);
+        }
+        return;
+      }
       if (dmPolicy === 'allowlist') {
         const allowFrom = this.config.allowFrom || [];
         if (!allowFrom.includes(callback.senderId)) {
@@ -831,19 +859,28 @@ export class DingTalkClient implements Channel {
       }
     }
 
-    // 解析消息内容：钉钉文本消息在 text.content 字段里
+    // 解析消息内容：钉钉不同消息类型 content 字段格式不同
     let messageText = '';
-    if (callback.text?.content) {
-      messageText = callback.text.content.trim();
-    } else if (callback.msgtype === 'richText' && callback.content) {
-      try {
-        const parsed = JSON.parse(callback.content);
-        messageText = parsed.content || parsed.text || JSON.stringify(parsed);
-      } catch {
-        messageText = callback.content;
+    const rawContent = callback.text?.content ?? callback.content;
+    this.logger(`[debug] msgtype=${callback.msgtype}, text.content type=${typeof callback.text?.content}, content type=${typeof callback.content}`);
+
+    if (typeof rawContent === 'string') {
+      // content 是字符串：可能是纯文本或 JSON 字符串
+      if (callback.msgtype === 'richText') {
+        try {
+          const parsed = JSON.parse(rawContent);
+          messageText = typeof parsed.content === 'string' ? parsed.content
+            : typeof parsed.text === 'string' ? parsed.text
+            : JSON.stringify(parsed);
+        } catch {
+          messageText = rawContent;
+        }
+      } else {
+        messageText = rawContent.trim();
       }
-    } else if (callback.content) {
-      messageText = callback.content;
+    } else if (rawContent != null) {
+      // content 是对象或其他非字符串类型
+      messageText = JSON.stringify(rawContent);
     }
 
     if (!messageText.trim()) {
@@ -998,7 +1035,7 @@ export class DingTalkClient implements Channel {
   async sendPrivateMessage(
     userId: string,
     content: string,
-    msgKey: string = 'text'
+    msgKey: string = 'sampleText'
   ): Promise<DingTalkSendResponse> {
     const accessToken = await this.getAccessToken();
     const robotCode = this.config.robotCode || this.config.clientId;
@@ -1341,6 +1378,10 @@ registerChannel({
       profileName: config.profileName,
       workDir: config.workDir,
       systemPrompt: config.systemPrompt,
+      groupPolicy: config.groupPolicy as 'open' | 'allowlist' | 'disabled' | undefined,
+      dmPolicy: config.dmPolicy as 'open' | 'pairing' | 'allowlist' | 'disabled' | undefined,
+      allowFrom: config.allowFrom as unknown as string[] | undefined,
+      groupAllowFrom: config.groupAllowFrom as unknown as string[] | undefined,
     })
   },
 })
