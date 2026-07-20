@@ -145,3 +145,47 @@ export function formatChatHistory(entries: ChatHistoryEntry[]): string {
 
   return lines.join('\n');
 }
+
+/**
+ * 按时间戳就近查找历史记录条目
+ * 用于引用回复时，根据钉钉回调的 repliedMsg.createdAt 在本地历史中查找完整消息内容
+ *
+ * @param claudetalkDir - .claudetalk 目录路径
+ * @param conversationId - 会话 ID
+ * @param targetTimestamp - 目标时间戳（ms），通常来自 repliedMsg.createdAt
+ * @param maxDiffMs - 最大允许时间差（ms），默认 5 秒
+ * @returns 最接近的条目，或在阈值内找不到时返回 null
+ */
+export function findClosestEntryByTimestamp(
+  claudetalkDir: string,
+  conversationId: string,
+  targetTimestamp: number,
+  maxDiffMs: number = 5000
+): ChatHistoryEntry | null {
+  const entries = loadChatHistory(claudetalkDir, conversationId);
+  if (entries.length === 0) {
+    return null;
+  }
+
+  let best: ChatHistoryEntry | null = null;
+  let bestDiff = Infinity;
+  for (const entry of entries) {
+    const diff = Math.abs(entry.timestamp - targetTimestamp);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = entry;
+    }
+  }
+
+  if (best && bestDiff <= maxDiffMs) {
+    logger(
+      `[chat-history] Found closest entry for timestamp ${targetTimestamp}: diff=${bestDiff}ms, role=${best.role}, senderId=${best.senderId}`
+    );
+    return best;
+  }
+
+  logger(
+    `[chat-history] No entry within ${maxDiffMs}ms of timestamp ${targetTimestamp} (closest diff=${bestDiff}ms)`
+  );
+  return null;
+}

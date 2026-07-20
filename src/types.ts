@@ -140,6 +140,8 @@ export interface DingTalkInboundCallback {
   };
   /** 会话 ID */
   conversationId: string;
+  /** 会话名称（群聊时为群名，私聊时可能为空） */
+  conversationTitle?: string;
   /** 发送者 ID */
   senderId: string;
   /** 发送者昵称（钉钉回调中自带） */
@@ -148,8 +150,8 @@ export interface DingTalkInboundCallback {
   senderCorpId?: string;
   /** 发送者员工 ID */
   senderStaffId?: string;
-  /** 消息内容 */
-  content: string;
+  /** 消息内容（纯文本时为 string，richText 时为对象） */
+  content: string | Record<string, unknown>;
   /** 消息创建时间 */
   createTime: number;
   /** 消息类型 */

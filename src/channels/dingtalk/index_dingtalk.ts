@@ -31,6 +31,7 @@ import {
   appendChatHistory,
   loadChatHistory,
   formatChatHistory,
+  findClosestEntryByTimestamp,
 } from './chat-history.js';
 
 const DINGTALK_API_BASE = 'https://api.dingtalk.com';
@@ -342,13 +343,25 @@ export class DingTalkClient implements Channel {
       : '';
 
     // 构建嵌套回复引用段落
+    // 钉钉回调的 repliedMsg.content 只有消息标题（截断），尝试从本地历史补全完整内容
     let repliedMsgSection = '';
     if (callback.text?.isReplyMsg && callback.text?.repliedMsg) {
       const replied = callback.text.repliedMsg;
-      const repliedContent = typeof replied.content === 'object'
+      const truncatedContent = typeof replied.content === 'object'
         ? replied.content.text
         : replied.content;
-      repliedMsgSection = `- **引用消息**: 发送者=${replied.senderId}, 内容=${repliedContent}`;
+
+      // 用 createdAt 时间戳从本地历史就近查找完整内容
+      const historyEntry = findClosestEntryByTimestamp(
+        this.claudetalkDir, conversationId, replied.createdAt
+      );
+      const fullContent = historyEntry?.content ?? truncatedContent;
+      // 截断到 500 字符，避免上下文过长
+      const displayContent = fullContent.length > 500
+        ? fullContent.substring(0, 500) + '...'
+        : fullContent;
+
+      repliedMsgSection = `- **引用消息**: 发送者=${replied.senderId}, 内容=${displayContent}`;
     }
 
     // 读取模板文件：优先用户自定义，其次内置默认
@@ -884,9 +897,19 @@ export class DingTalkClient implements Channel {
         return;
       }
       if (groupPolicy === 'allowlist') {
-        const groupAllowFrom = this.config.groupAllowFrom || this.config.allowFrom || [];
-        if (!groupAllowFrom.includes(callback.senderId)) {
-          this.logger(`Sender ${callback.senderId} not in group allowlist, ignoring`);
+        const groupAllowFrom = this.config.groupAllowFrom || [];
+        if (!groupAllowFrom.includes(callback.conversationId)) {
+          this.logger(`Group ${callback.conversationId} not in group allowlist, ignoring`);
+          const groupTitle = callback.conversationTitle || callback.conversationId;
+          try {
+            await this.sendMarkdownMessage(
+              callback.conversationId,
+              `当前群「${groupTitle}」不在机器人白名单中，请联系管理员添加。`,
+              true
+            );
+          } catch (error) {
+            this.logger(`Failed to send group allowlist hint: ${error}`);
+          }
           return;
         }
       }
@@ -908,7 +931,13 @@ export class DingTalkClient implements Channel {
       if (dmPolicy === 'allowlist') {
         const allowFrom = this.config.allowFrom || [];
         if (!allowFrom.includes(callback.senderId)) {
-          this.logger(`Sender ${callback.senderId} not in allowlist, ignoring`);
+          this.logger(`Sender ${callback.senderId} not in DM allowlist, ignoring`);
+          const userId = callback.senderStaffId || callback.senderId;
+          try {
+            await this.sendPrivateMessage(userId, '你不在机器人私聊白名单中，请在群内 @我 进行对话。');
+          } catch (error) {
+            this.logger(`Failed to send DM allowlist hint: ${error}`);
+          }
           return;
         }
       }
@@ -919,22 +948,11 @@ export class DingTalkClient implements Channel {
     const rawContent = callback.text?.content ?? callback.content;
     this.logger(`[debug] msgtype=${callback.msgtype}, text.content type=${typeof callback.text?.content}, content type=${typeof callback.content}`);
 
-    if (typeof rawContent === 'string') {
-      // content 是字符串：可能是纯文本或 JSON 字符串
-      if (callback.msgtype === 'richText') {
-        try {
-          const parsed = JSON.parse(rawContent);
-          messageText = typeof parsed.content === 'string' ? parsed.content
-            : typeof parsed.text === 'string' ? parsed.text
-            : JSON.stringify(parsed);
-        } catch {
-          messageText = rawContent;
-        }
-      } else {
-        messageText = rawContent.trim();
-      }
+    if (callback.msgtype === 'richText') {
+      messageText = await this.parseRichTextContent(rawContent);
+    } else if (typeof rawContent === 'string') {
+      messageText = rawContent.trim();
     } else if (rawContent != null) {
-      // content 是对象或其他非字符串类型
       messageText = JSON.stringify(rawContent);
     }
 
@@ -943,7 +961,7 @@ export class DingTalkClient implements Channel {
       return;
     }
 
-    this.logger(`Received message from senderId=${callback.senderId}, senderStaffId=${callback.senderStaffId || '(empty)'}, conversationId=${callback.conversationId}, isGroup=${isGroup}: ${messageText}`);
+    this.logger(`Received message from senderId=${callback.senderId} (${callback.senderNick || '?'}), senderStaffId=${callback.senderStaffId || '(empty)'}, conversationId=${callback.conversationId} (${callback.conversationTitle || '?'}), isGroup=${isGroup}: ${messageText}`);
 
     // 群聊：确定 session 归属（对话线程所有者）
     let sessionOwnerId = callback.senderId;
@@ -1198,10 +1216,11 @@ export class DingTalkClient implements Channel {
     const robotCode = this.config.robotCode || this.config.clientId;
     const msgKey = 'sampleMarkdown';
     // 用回复内容的首行作为消息预览标题，清理 markdown 格式并截取
+    // 跳过 > 开头的引用块行，避免 lastMsg 显示为引用内容而非实际回复
     const titleRaw = content
       .split('\n')
       .map(l => l.trim())
-      .find(l => l.length > 0) || content;
+      .find(l => l.length > 0 && !l.startsWith('>')) || content;
     const title = titleRaw
       .replace(/[*_`~>#\[\]()-]/g, '')
       .replace(/<at[^>]*>(.*?)<\/at>/g, '$1')
@@ -1289,7 +1308,7 @@ export class DingTalkClient implements Channel {
           [templateKey]: content,
         },
       },
-      dynamicSummary: content.substring(0, 100),
+      dynamicSummary: content.replace(/^>\s.*\n+/m, '').substring(0, 100),
     };
 
     const response = await fetch(
@@ -1342,7 +1361,7 @@ export class DingTalkClient implements Channel {
         },
       },
       isFinalize,
-      dynamicSummary: content.substring(0, 100),
+      dynamicSummary: content.replace(/^>\s.*\n+/m, '').substring(0, 100),
     };
 
     const response = await fetch(
@@ -1371,21 +1390,94 @@ export class DingTalkClient implements Channel {
     const accessToken = await this.getAccessToken();
     const robotCode = this.config.robotCode || this.config.clientId;
 
-    const response = await fetch(
-      `${DINGTALK_API_BASE}/v1.0/robot/media/download?downloadCode=${downloadCode}&robotCode=${robotCode}`,
-      {
-        headers: {
-          'x-acs-dingtalk-access-token': accessToken,
-        },
-      }
-    );
+    // Step 1: POST to get a temporary downloadUrl
+    const metaResponse = await fetch(`${DINGTALK_API_BASE}/v1.0/robot/messageFiles/download`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-acs-dingtalk-access-token': accessToken,
+      },
+      body: JSON.stringify({ downloadCode, robotCode }),
+    });
 
-    if (!response.ok) {
-      throw new Error(`Failed to download media: ${response.statusText}`);
+    if (!metaResponse.ok) {
+      const errBody = await metaResponse.text().catch(() => '');
+      throw new Error(`Failed to fetch downloadUrl: ${metaResponse.status} ${metaResponse.statusText}, body=${errBody.substring(0, 300)}`);
     }
 
-    const arrayBuffer = await response.arrayBuffer();
+    const meta = await metaResponse.json() as { downloadUrl?: string };
+    if (!meta.downloadUrl) {
+      throw new Error(`downloadUrl missing in response: ${JSON.stringify(meta).substring(0, 300)}`);
+    }
+
+    // Step 2: GET the downloadUrl to fetch the actual file bytes
+    const fileResponse = await fetch(meta.downloadUrl);
+    if (!fileResponse.ok) {
+      throw new Error(`Failed to download file from downloadUrl: ${fileResponse.status} ${fileResponse.statusText}`);
+    }
+
+    const arrayBuffer = await fileResponse.arrayBuffer();
     return Buffer.from(arrayBuffer);
+  }
+
+  /**
+   * 下载图片并保存到本地
+   * 保存到 .claudetalk/dingtalk/images/ 目录下
+   * 返回本地文件路径，下载失败时返回占位文本
+   */
+  private async downloadAndSaveImage(downloadCode: string): Promise<string> {
+    try {
+      const imageBuffer = await this.downloadMedia(downloadCode);
+      const imageDir = path.join(this.claudetalkDir, 'dingtalk', 'images');
+      if (!fs.existsSync(imageDir)) {
+        fs.mkdirSync(imageDir, { recursive: true });
+      }
+      const fileName = `${Date.now()}.png`;
+      const filePath = path.join(imageDir, fileName);
+      fs.writeFileSync(filePath, imageBuffer);
+      this.logger(`[image] Downloaded and saved: ${filePath} (${imageBuffer.length} bytes)`);
+      return filePath;
+    } catch (error) {
+      this.logger(`[image] Failed to download image: ${error}`);
+      return '[图片下载失败]';
+    }
+  }
+
+  /**
+   * 解析 richText 消息内容
+   * 遍历 richText 数组，提取文字、下载图片，拼成可读的纯文本
+   */
+  private async parseRichTextContent(rawContent: unknown): Promise<string> {
+    let parsed: unknown = rawContent;
+    if (typeof rawContent === 'string') {
+      try {
+        parsed = JSON.parse(rawContent);
+      } catch {
+        return rawContent;
+      }
+    }
+
+    const richTextArray = (parsed as { richText?: unknown[] })?.richText;
+    if (!Array.isArray(richTextArray)) {
+      const fallback = typeof rawContent === 'string' ? rawContent : JSON.stringify(rawContent);
+      return fallback;
+    }
+
+    const parts: string[] = [];
+    for (const element of richTextArray) {
+      const item = element as { text?: string; type?: string; downloadCode?: string };
+      if (typeof item.text === 'string') {
+        parts.push(item.text);
+      } else if (item.type === 'picture' && item.downloadCode) {
+        const imagePath = await this.downloadAndSaveImage(item.downloadCode);
+        parts.push(`[图片: ${imagePath}]`);
+        this.logger(`[richText] Picture downloaded to: ${imagePath}`);
+      }
+    }
+
+    const result = parts.join('').trim();
+    this.logger(`[richText] Parsed: ${result.substring(0, 200)}`);
+    return result;
   }
 
   /**
