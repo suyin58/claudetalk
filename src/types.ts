@@ -309,6 +309,7 @@ export interface ChannelMessageContext {
   replyTo?: {
     senderNick?: string
     senderId: string
+    staffId?: string
     messageSnippet: string
   }
 }
@@ -336,7 +337,7 @@ export interface Channel {
   /** 注册消息处理器 */
   onMessage(handler: (context: ChannelMessageContext, message: string) => Promise<void>): void
   /** 发送消息 */
-  sendMessage(conversationId: string, content: string, isGroup: boolean, sessionOwnerId?: string, replyTo?: { senderNick?: string; senderId: string; messageSnippet: string }): Promise<void>
+  sendMessage(conversationId: string, content: string, isGroup: boolean, sessionOwnerId?: string, replyTo?: { senderNick?: string; senderId: string; staffId?: string; messageSnippet: string }): Promise<void>
   /** 把 mention 目标渲染成本 channel 的 @ 标签格式（feishu: <at user_id="">name</at>；dingtalk: @profileName） */
   formatMention(target: MentionTarget): string
   /** 发送上线通知（可选，各 Channel 自行实现） */

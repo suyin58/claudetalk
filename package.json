@@ -40,6 +40,7 @@
   ],
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.7.0",
+    "dingtalk-stream": "^2.1.6-beta.1",
     "socks-proxy-agent": "^8.0.5",
     "ws": "^8.21.0"
   },

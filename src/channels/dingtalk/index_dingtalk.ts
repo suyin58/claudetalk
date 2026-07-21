@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { WebSocket } from 'ws';
+import { DWClient, type DWClientDownStream } from 'dingtalk-stream';
 import type {
   Channel,
   ChannelMessageContext,
@@ -35,7 +35,6 @@ import {
 } from './chat-history.js';
 
 const DINGTALK_API_BASE = 'https://api.dingtalk.com';
-const DINGTALK_STREAM_URL = process.env.DINGTALK_STREAM_URL || 'wss://dingtalk-stream.dingtalk.com/connect';
 
 /**
  * 从文本中提取第一个 **xxx** 加粗内容作为显示名（角色 systemPrompt 与 agent.md 都遵循该约定）
@@ -63,27 +62,6 @@ function extractDisplayNameFromText(text: string, skipFrontmatter: boolean): str
   return null;
 }
 
-// 钉钉 Stream 连接票据响应
-interface DingTalkStreamTicketResponse {
-  endpoint: string;
-  ticket: string;
-}
-
-// 钉钉 Stream WebSocket 帧
-interface DingTalkStreamFrame {
-  specVersion: string;
-  type: string;
-  headers: {
-    appId: string;
-    connectionId: string;
-    contentType: string;
-    messageId: string;
-    time: string;
-    topic: string;
-  };
-  data: string;
-}
-
 // 消息到达时的回调函数类型（内部使用，保留原始钉钉回调）
 type InternalMessageHandler = (callback: DingTalkInboundCallback) => Promise<void>;
 
@@ -95,10 +73,7 @@ export class DingTalkClient implements Channel {
   private tokenCache: { accessToken: string; expiresAt: number } | null = null;
   private internalMessageHandler: InternalMessageHandler | null = null;
   private channelMessageHandler: ((context: ChannelMessageContext, message: string) => Promise<void>) | null = null;
-  private ws: WebSocket | null = null;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private isManuallyClosed: boolean = false;
-  private reconnectDelayMs: number = 3000;
+  private dwClient: DWClient | null = null;
   private readonly logger: (msg: string) => void;
 
   // peer-message 相关
@@ -108,13 +83,11 @@ export class DingTalkClient implements Channel {
   private processedPeerIds = new Set<string>();
   // 私聊会话 ID → 用户 open_id 映射缓存（钉钉私聊 conversationId 是会话ID，发送时需要用户 open_id）
   private privateSenderCache = new Map<string, string>();
-  // 心跳超时检测：钉钉有时静默断连（不发 close 帧），需要主动检测并重连
-  // 注意：钉钉 Stream 连接建立后有约 60 秒的"预热期"，期间不会推送任何帧（包括 ping）
-  // 因此超时时间需要设置得比预热期更长，避免误判为断连
-  private lastFrameAt: number = 0;
-  private wsAlive: boolean = true;
-  private hasReceivedFrame: boolean = false;
-  private heartbeatWatchdog: ReturnType<typeof setInterval> | null = null;
+  // 消息去重：防止重连后钉钉重试投递导致重复处理
+  private processedMsgIds = new Map<string, number>();
+  private static readonly DEDUP_TTL = 60 * 1000;
+  // sessionWebhook 缓存：用于群聊回复时 @人（groupMessages/send API 不支持 atUserIds）
+  private sessionWebhookCache = new Map<string, { url: string; expiresAt: number }>();
 
   constructor(config: DingTalkChannelConfig) {
     this.config = config;
@@ -197,54 +170,6 @@ export class DingTalkClient implements Channel {
     };
 
     return data.accessToken;
-  }
-
-  /**
-   * 获取 Stream 连接票据
-   */
-  private async getStreamTicket(): Promise<DingTalkStreamTicketResponse> {
-    this.logger('[getStreamTicket] Fetching access token...');
-    const accessToken = await this.getAccessToken();
-    this.logger('[getStreamTicket] Access token obtained');
-
-    const requestBody = {
-      clientId: this.config.clientId,
-      clientSecret: this.config.clientSecret,
-      subscriptions: [
-        {
-          type: 'EVENT',
-          topic: '*',
-        },
-        {
-          type: 'CALLBACK',
-          topic: '/v1.0/im/bot/messages/get',
-        },
-      ],
-      ua: 'claude-code-dingtalk-channel/0.1.0',
-    };
-
-    this.logger('[getStreamTicket] Requesting stream ticket...');
-    const response = await fetch(
-      `${DINGTALK_API_BASE}/v1.0/gateway/connections/open`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-acs-dingtalk-access-token': accessToken,
-        },
-        body: JSON.stringify(requestBody),
-      }
-    );
-
-    const data = await response.json() as { endpoint: string; ticket: string; errcode?: number; errmsg?: string };
-    this.logger('[getStreamTicket] Response: ' + JSON.stringify({ status: response.status, data }));
-
-    if (data.errcode && data.errcode !== 0) {
-      throw new Error(`Failed to get stream ticket: ${data.errmsg}`);
-    }
-
-    this.logger('[getStreamTicket] Stream ticket obtained: ' + JSON.stringify({ endpoint: data.endpoint, ticket: data.ticket?.substring(0, 20) + '...' }));
-    return { endpoint: data.endpoint, ticket: data.ticket };
   }
 
   /**
@@ -333,8 +258,10 @@ export class DingTalkClient implements Channel {
       ? formatChatHistory(historyWithoutCurrent)
       : '（暂无历史消息）';
 
-    // 构建发送者信息
-    const senderInfo = `${callback.senderId}`;
+    // 构建发送者信息（优先显示 senderNick，便于 Claude 识别用户）
+    const senderInfo = callback.senderNick
+      ? `${callback.senderNick} (${callback.senderId})`
+      : `${callback.senderId}`;
 
     // 构建 @列表段落（钉钉消息体中 atUserIds 包含被@的用户 ID 列表）
     const atUserIds = callback.atUserIds || [];
@@ -406,7 +333,8 @@ export class DingTalkClient implements Channel {
   }
 
   /**
-   * 启动 Stream WebSocket 连接，开始接收钉钉消息
+   * 启动官方 dingtalk-stream SDK 连接，开始接收钉钉消息
+   * SDK 内部负责 WebSocket 连接、心跳（keepAlive）、自动重连（指数退避）、SYSTEM 帧处理
    */
   async start(): Promise<void> {
     if (!this.config.clientId || !this.config.clientSecret) {
@@ -417,240 +345,76 @@ export class DingTalkClient implements Channel {
         '  export DINGTALK_CLIENT_SECRET=your_app_secret'
       );
     }
-    this.logger(`Connecting to DingTalk Stream... clientId=${this.config.clientId}`);
-
-    this.isManuallyClosed = false;
-    this.reconnectDelayMs = 3000;
+    this.logger(`Connecting to DingTalk Stream (official SDK)... clientId=${this.config.clientId}`);
 
     // 启动 peer-message 轮询
     this.startPeerMessagePolling();
 
-    // 启动连接
-    await this.connectStream();
+    // 创建官方 SDK 客户端
+    // keepAlive=false（SDK 默认）：不主动发 WebSocket ping，依赖服务端 SYSTEM/ping 和 KEEPALIVE 帧
+    // autoReconnect=true（SDK 默认）：连接断开时自动指数退避重连
+    this.dwClient = new DWClient({
+      clientId: this.config.clientId,
+      clientSecret: this.config.clientSecret,
+      ua: 'claudetalk/0.2.0',
+      debug: !!process.env.DINGTALK_DEBUG,
+    });
+
+    // 注册机器人消息回调：SDK 收到 CALLBACK 帧后通过 EventEmitter 派发到此
+    this.dwClient.registerCallbackListener(
+      '/v1.0/im/bot/messages/get',
+      (msg: DWClientDownStream) => {
+        this.logger(`[sdk callback] Received message: messageId=${msg.headers.messageId}, data=${msg.data?.substring(0, 500)}`);
+        // 立即 ACK，避免服务端 60s 重试投递
+        this.dwClient?.socketCallBackResponse(msg.headers.messageId, 'OK');
+        // 异步处理消息，不阻塞 SDK 帧循环（Claude 处理可能耗时数十秒）
+        Promise.resolve().then(async () => {
+          try {
+            const callback = JSON.parse(msg.data) as DingTalkInboundCallback;
+            await this.handleInboundMessage(callback);
+          } catch (error) {
+            this.logger(`Failed to parse/handle inbound message: ${error}`);
+          }
+        });
+      }
+    );
+
+    // SDK connect() 内部处理：getEndpoint → WebSocket 连接 → 自动重连
+    // 失败时 SDK 自动 scheduleReconnect（指数退避 1s→60s），无需手动重试
+    await this.dwClient.connect();
+    this.logger('DingTalk Stream connected (official SDK)');
   }
 
   /**
-   * 停止 WebSocket 连接
+   * 停止 SDK 连接
    */
   stop(): void {
-    this.isManuallyClosed = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
     if (this.peerPollTimer) {
       clearInterval(this.peerPollTimer);
       this.peerPollTimer = null;
     }
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
+    if (this.dwClient) {
+      this.dwClient.disconnect();
+      this.dwClient = null;
     }
     this.logger('DingTalk Stream stopped');
   }
 
   /**
-   * 建立 WebSocket Stream 连接
+   * 消息去重：防止 SDK 重连后钉钉重试投递导致重复处理
    */
-  private async connectStream(): Promise<void> {
-    const { endpoint, ticket } = await this.getStreamTicket();
-
-    const wsUrl = `${endpoint}?ticket=${encodeURIComponent(ticket)}`;
-    this.logger(`Connecting to DingTalk Stream endpoint: ${endpoint}`);
-
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(wsUrl);
-      this.ws = ws;
-
-      ws.on('open', () => {
-        this.logger('DingTalk Stream connected');
-        // 重置重连延迟
-        this.reconnectDelayMs = 3000;
-        this.lastFrameAt = Date.now();
-        // 启动心跳 watchdog：超过 3 分钟无帧则强制重连，避免连接静默死亡后机器人卡死
-        this.startHeartbeatWatchdog(ws);
-        resolve();
-      });
-
-      ws.on('message', async (data: Buffer) => {
-        // 每次收到帧都更新时间戳（包括心跳 ping）
-        this.lastFrameAt = Date.now();
-        this.hasReceivedFrame = true;
-        try {
-          const frame = JSON.parse(data.toString()) as DingTalkStreamFrame;
-          await this.handleStreamFrame(ws, frame);
-        } catch (error) {
-          this.logger(`Failed to handle stream frame: ${error}`);
-        }
-      });
-
-      ws.on('error', (error: Error) => {
-        this.logger('DingTalk Stream WebSocket error: ' + error.message);
-        // 错误不 reject，等待 close 事件处理重连
-      });
-
-      ws.on('close', (code: number, reason: Buffer) => {
-        const reasonStr = reason.toString();
-        this.logger(`DingTalk Stream disconnected: code=${code}, reason=${reasonStr}`);
-        this.ws = null;
-        this.stopHeartbeatWatchdog();
-
-        if (!this.isManuallyClosed) {
-          // code=1006：异常断连（WebSocket 握手失败、网络中断等），使用指数退避避免雪崩
-          // code=1005：服务器正常关闭（如空闲超时），立即重连以减少消息丢失窗口
-          // 其他 code：保守起见也使用退避
-          const isAbnormalClose = code === 1006;
-          if (isAbnormalClose) {
-            this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30000);
-            this.logger(`[ws close] Abnormal close (code=${code}), reconnecting in ${this.reconnectDelayMs}ms...`);
-            this.reconnectTimer = setTimeout(() => {
-              this.startReconnectLoop();
-            }, this.reconnectDelayMs);
-          } else {
-            // 正常关闭（服务器主动断开），重置退避并立即重连
-            this.reconnectDelayMs = 3000;
-            this.logger(`[ws close] Normal close (code=${code}), reconnecting immediately...`);
-            this.startReconnectLoop();
-          }
-        }
-      });
-    });
-  }
-
-  /**
-   * 心跳 watchdog：双层检测
-   * 1. WebSocket 协议级 ping/pong：每 30s 检测连接是否存活
-   * 2. 帧级别活跃检测：
-   *    - 首帧未到时：等待 15 分钟（钉钉服务端重启后需要 5-10 分钟才开始投递）
-   *    - 首帧已到后：5 分钟无帧则重连（检测静默停止投递）
-   */
-  private startHeartbeatWatchdog(ws: WebSocket): void {
-    this.stopHeartbeatWatchdog();
-    this.wsAlive = true;
-    this.hasReceivedFrame = false;
-
-    ws.on('pong', () => {
-      this.wsAlive = true;
-    });
-
-    this.heartbeatWatchdog = setInterval(() => {
-      // 检查 1：WebSocket 协议级 pong
-      if (!this.wsAlive) {
-        this.logger(`[watchdog] No WebSocket pong since last ping, terminating...`);
-        this.stopHeartbeatWatchdog();
-        ws.terminate();
-        return;
+  private isDuplicate(msgId: string): boolean {
+    const now = Date.now();
+    for (const [id, ts] of this.processedMsgIds) {
+      if (now - ts > DingTalkClient.DEDUP_TTL) {
+        this.processedMsgIds.delete(id);
       }
-      // 检查 2：帧级别活跃度
-      const frameIdleMs = Date.now() - this.lastFrameAt;
-      const threshold = this.hasReceivedFrame ? 5 * 60 * 1000 : 15 * 60 * 1000;
-      if (frameIdleMs > threshold) {
-        const label = this.hasReceivedFrame ? 'no frame since last activity' : 'no first frame yet (grace period exceeded)';
-        this.logger(`[watchdog] No frame received for ${Math.round(frameIdleMs / 1000)}s (${label}), forcing reconnect...`);
-        this.stopHeartbeatWatchdog();
-        ws.terminate();
-        return;
-      }
-      this.wsAlive = false;
-      try {
-        ws.ping();
-      } catch {
-        // socket already closed
-      }
-    }, 30 * 1000);
-  }
-
-  /**
-   * 停止心跳 watchdog
-   */
-  private stopHeartbeatWatchdog(): void {
-    if (this.heartbeatWatchdog) {
-      clearInterval(this.heartbeatWatchdog);
-      this.heartbeatWatchdog = null;
     }
-  }
-
-  /**
-   * 启动重连循环，持续重连直到成功或手动停止
-   */
-  private startReconnectLoop(): void {
-    const attemptReconnect = async (): Promise<void> => {
-      try {
-        this.logger(`[reconnect] Attempting to connect...`);
-        await this.connectStream();
-        this.logger(`[reconnect] Connected successfully`);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        this.logger(`[reconnect] Reconnect failed: ${errorMessage}`);
-        this.logger(`[reconnect] Error details: ${JSON.stringify(error)}`);
-        
-        // 指数退避，最大 60 秒
-        this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 60000);
-        
-        // 继续尝试重连
-        if (!this.isManuallyClosed) {
-          this.logger(`[reconnect] Will retry in ${this.reconnectDelayMs}ms...`);
-          this.reconnectTimer = setTimeout(attemptReconnect, this.reconnectDelayMs);
-        }
-      }
-    };
-
-    attemptReconnect();
-  }
-
-  /**
-   * 处理 Stream 帧
-   */
-  private async handleStreamFrame(ws: WebSocket, frame: DingTalkStreamFrame): Promise<void> {
-    const { type, headers, data } = frame;
-    this.logger(`[stream] frame: type=${type}, topic=${headers?.topic}, data=${data?.substring(0, 2000)}`);
-
-    // 回复 ACK
-    const ack = {
-      code: 200,
-      headers: {
-        contentType: 'application/json',
-        messageId: headers.messageId,
-        time: String(Date.now()),
-      },
-      message: 'OK',
-      data: '',
-    };
-
-    if (type === 'SYSTEM') {
-      // 系统消息（心跳等）
-      if (headers.topic === 'ping') {
-        // 官方 SDK 格式：原样回传 headers + data（含 opaque），不能构造新 headers
-        ws.send(JSON.stringify({
-          code: 200,
-          headers,
-          message: 'OK',
-          data,
-        }));
-      } else {
-        ws.send(JSON.stringify(ack));
-      }
-      return;
+    if (this.processedMsgIds.has(msgId)) {
+      return true;
     }
-
-    if (type === 'CALLBACK' && headers.topic === '/v1.0/im/bot/messages/get') {
-      // 先立即回 ACK，避免阻塞 WebSocket 帧循环（Claude 处理消息可能需要数十秒）
-      ws.send(JSON.stringify(ack));
-
-      // 异步处理消息，不阻塞当前帧循环，确保心跳等帧能正常响应
-      Promise.resolve().then(async () => {
-        try {
-          const callback = JSON.parse(data) as DingTalkInboundCallback;
-          await this.handleInboundMessage(callback);
-        } catch (error) {
-          this.logger(`Failed to parse inbound message: ${error}`);
-        }
-      });
-      return;
-    }
-
-    // 其他类型，统一回 ACK
-    ws.send(JSON.stringify(ack));
+    this.processedMsgIds.set(msgId, now);
+    return false;
   }
 
   /**
@@ -884,6 +648,20 @@ export class DingTalkClient implements Channel {
   }
 
   private async handleInboundMessage(callback: DingTalkInboundCallback): Promise<void> {
+    // 消息去重：防止重连后钉钉重试投递导致重复处理
+    if (callback.msgId && this.isDuplicate(callback.msgId)) {
+      this.logger(`Duplicate message ${callback.msgId}, ignoring`);
+      return;
+    }
+
+    // 缓存 sessionWebhook：用于群聊回复时 @人（groupMessages/send 不支持 atUserIds）
+    if (callback.sessionWebhook && callback.sessionWebhookExpiredTime) {
+      this.sessionWebhookCache.set(callback.conversationId, {
+        url: callback.sessionWebhook,
+        expiresAt: callback.sessionWebhookExpiredTime,
+      });
+    }
+
     const isGroup = callback.conversationType === '2';
 
     // 更新 chat-members.json：记录当前机器人的 chatbotUserId 和消息发送者信息
@@ -1029,6 +807,7 @@ export class DingTalkClient implements Channel {
         replyTo: isGroup ? {
           senderNick: callback.senderNick,
           senderId: callback.senderId,
+          staffId: callback.senderStaffId,
           messageSnippet: messageText.substring(0, 100),
         } : undefined,
       };
@@ -1046,7 +825,7 @@ export class DingTalkClient implements Channel {
     content: string,
     isGroup: boolean,
     sessionOwnerId?: string,
-    replyTo?: { senderNick?: string; senderId: string; messageSnippet: string }
+    replyTo?: { senderNick?: string; senderId: string; staffId?: string; messageSnippet: string }
   ): Promise<void> {
     const messageType = this.config.messageType || 'markdown';
 
@@ -1076,7 +855,7 @@ export class DingTalkClient implements Channel {
     if (messageType === 'card' && this.config.cardTemplateId) {
       await this.createAICard(conversationId, displayContent);
     } else {
-      await this.sendMarkdownMessage(conversationId, displayContent, isGroup);
+      await this.sendMarkdownMessage(conversationId, displayContent, isGroup, replyTo?.staffId);
     }
 
     // 群聊：写入历史记录 + 解析 @标签写入 peer-message
@@ -1210,7 +989,8 @@ export class DingTalkClient implements Channel {
   async sendMarkdownMessage(
     conversationId: string,
     content: string,
-    isGroup: boolean
+    isGroup: boolean,
+    atUserId?: string
   ): Promise<DingTalkSendResponse> {
     const accessToken = await this.getAccessToken();
     const robotCode = this.config.robotCode || this.config.clientId;
@@ -1231,6 +1011,31 @@ export class DingTalkClient implements Channel {
     });
 
     if (isGroup) {
+      // 优先使用 sessionWebhook 发送（支持 atUserIds @人，groupMessages/send 不支持）
+      const cached = this.sessionWebhookCache.get(conversationId);
+      const now = Date.now();
+      if (cached && cached.expiresAt > now) {
+        const body: Record<string, unknown> = { msgKey, msgParam };
+        if (atUserId) {
+          body.atUserIds = [atUserId];
+        }
+        const response = await fetch(cached.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const result = await response.json() as DingTalkSendResponse;
+        if (!response.ok || result.errcode) {
+          this.logger(`[sendMarkdownMessage] sessionWebhook send failed: status=${response.status}, errcode=${result.errcode}, errmsg=${result.errmsg}`);
+        } else {
+          this.logger(`[sendMarkdownMessage] sessionWebhook send success: conversationId=${conversationId}, atUser=${atUserId || 'none'}`);
+        }
+        return result;
+      }
+      // sessionWebhook 不可用，回退到 groupMessages/send API（不支持 @人）
+      if (atUserId) {
+        this.logger(`[sendMarkdownMessage] No valid sessionWebhook for ${conversationId}, falling back to groupMessages/send (no @mention)`);
+      }
       const response = await fetch(
         `${DINGTALK_API_BASE}/v1.0/robot/groupMessages/send`,
         {
